@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sogrey/Cesium-start-Example.git"
+    "url": "git@github.com:Sogrey/Cesium-start-Example.git"
   },
   "keywords": [
     "cesium",
