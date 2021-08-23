@@ -23,6 +23,6 @@
   },
   "homepage": "https://github.com/Sogrey/Cesium-start-Example#readme",
   "devDependencies": {
-    "serialize-javascript": ">=2.1.1"
+    "serialize-javascript": ">=3.1.0"
   }
 }
