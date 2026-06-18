@@ -1,0 +1,861 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/19 00:34:56
+页面标题: Cesium 通视分析
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 通视分析</title>
+<meta name="description" content="实现了一个完整的通视分析示例。这个工具可以在地形和3D建筑场景中，分析两点之间是否可见，并标记出遮挡位置。" />
+<template>
+<div id="cesiumContainer"></div>
+
+<!-- ===== 顶部控制面板 ===== -->
+<div class="control-panel">
+  <button class="btn-start" id="selectStartBtn">📍 选择起点</button>
+  <button class="btn-end" id="selectEndBtn" disabled>🎯 选择终点</button>
+  <button class="btn-analyze" id="analysisBtn" disabled>🔍 执行分析</button>
+  <button class="btn-clear" id="clearBtn">🗑 清空</button>
+</div>
+
+<!-- ===== 结果提示区域 ===== -->
+<div class="result-area">
+  <div class="tip-text" id="resultTip">
+    <span class="status-dot idle"></span>
+    点击「选择起点」在地图上标记起点
+  </div>
+  <div class="occlusion-detail" id="occlusionTip"></div>
+</div>
+</template>
+<script>
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  baseLayer: false,
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+
+// 尝试加载真实地形
+if (typeof Cesium.createWorldTerrainAsync === 'function') {
+  Cesium.createWorldTerrainAsync({
+    requestWaterMask: true,
+    requestVertexNormals: true
+  }).then(function(provider) {
+    viewer.terrainProvider = provider;
+    console.log('✅ 真实地形加载成功');
+  }).catch(function(e) {
+    console.warn('真实地形加载失败，使用椭球体地形', e);
+  });
+}
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+// 添加高德影像底图
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+viewer.camera.setView({
+  destination: Cesium.Cartesian3.fromDegrees(116.3974, 39.9093, 3000),
+  orientation: {
+    heading: Cesium.Math.toRadians(0),
+    pitch: Cesium.Math.toRadians(-35),
+    roll: 0
+  }
+});
+
+// ================================================================
+//  2. 通视分析器类（优化版：自动清除旧结果）
+// ================================================================
+class VisibilityAnalyzer {
+  constructor(viewer) {
+    this.viewer = viewer;
+    this.startPoint = null;
+    this.endPoint = null;
+    this.analysisPrimitive = null;
+    this.occlusionPrimitive = null;
+    this.occlusionPoint = null;
+    this.startEntity = null;
+    this.endEntity = null;
+    this.analysisInProgress = false;
+    // 存储所有动态创建的辅助实体（用于清除）
+    this._dashEntities = [];
+    this._occlusionLabels = [];
+    this._resultEntities = [];
+  }
+
+  // ----- 清除所有分析结果（保留起点终点标记） -----
+  clearAnalysisResults() {
+    // 清除通视线
+    if (this.analysisPrimitive) {
+      this.viewer.scene.primitives.remove(this.analysisPrimitive);
+      this.analysisPrimitive = null;
+    }
+    // 清除遮挡点
+    if (this.occlusionPrimitive) {
+      this.viewer.scene.primitives.remove(this.occlusionPrimitive);
+      this.occlusionPrimitive = null;
+    }
+    // 清除虚线
+    this._dashEntities.forEach(e => this.viewer.entities.remove(e));
+    this._dashEntities = [];
+    // 清除遮挡标签
+    this._occlusionLabels.forEach(e => this.viewer.entities.remove(e));
+    this._occlusionLabels = [];
+    // 清除其他结果实体
+    this._resultEntities.forEach(e => this.viewer.entities.remove(e));
+    this._resultEntities = [];
+    // 重置遮挡点
+    this.occlusionPoint = null;
+  }
+
+  // ----- 清除所有（包括起点终点） -----
+  clearAll() {
+    this.clearAnalysisResults();
+    if (this.startEntity) {
+      this.viewer.entities.remove(this.startEntity);
+      this.startEntity = null;
+    }
+    if (this.endEntity) {
+      this.viewer.entities.remove(this.endEntity);
+      this.endEntity = null;
+    }
+    this.startPoint = null;
+    this.endPoint = null;
+    this.analysisInProgress = false;
+  }
+
+  // ----- 设置点 -----
+  setStartPoint(position) {
+    // 如果已有分析结果，先清除（但保留起点标记）
+    this.clearAnalysisResults();
+    this.startPoint = position;
+    this.drawStartPoint(position);
+  }
+
+  setEndPoint(position) {
+    // 如果已有分析结果，先清除（但保留起点终点标记）
+    this.clearAnalysisResults();
+    this.endPoint = position;
+    this.drawEndPoint(position);
+  }
+
+  getStartPoint() {
+    return this.startPoint;
+  }
+  getEndPoint() {
+    return this.endPoint;
+  }
+  getOcclusionPoint() {
+    return this.occlusionPoint;
+  }
+
+  // ----- 绘制点标记 -----
+  drawStartPoint(position) {
+    if (this.startEntity) {
+      this.viewer.entities.remove(this.startEntity);
+    }
+    this.startEntity = this.viewer.entities.add({
+      position: position,
+      point: {
+        pixelSize: 14,
+        color: Cesium.Color.GREEN,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2,
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+      },
+      label: {
+        text: '起点',
+        font: '14px sans-serif',
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        pixelOffset: new Cesium.Cartesian2(0, -28),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.5),
+        backgroundPadding: new Cesium.Cartesian2(6, 3)
+      }
+    });
+    return this.startEntity;
+  }
+
+  drawEndPoint(position) {
+    if (this.endEntity) {
+      this.viewer.entities.remove(this.endEntity);
+    }
+    this.endEntity = this.viewer.entities.add({
+      position: position,
+      point: {
+        pixelSize: 14,
+        color: Cesium.Color.RED,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2,
+        heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+      },
+      label: {
+        text: '终点',
+        font: '14px sans-serif',
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        pixelOffset: new Cesium.Cartesian2(0, -28),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.5),
+        backgroundPadding: new Cesium.Cartesian2(6, 3)
+      }
+    });
+    return this.endEntity;
+  }
+
+  // ----- 核心通视检测（地形 + 建筑） -----
+  checkLineOfSight() {
+    if (!this.startPoint || !this.endPoint) {
+      return {
+        isVisible: false,
+        occlusionPoint: null,
+        occlusionType: ''
+      };
+    }
+
+    const startCarto = Cesium.Cartographic.fromCartesian(this.startPoint);
+    const endCarto = Cesium.Cartographic.fromCartesian(this.endPoint);
+    const rayDirection = Cesium.Cartesian3.subtract(this.endPoint, this.startPoint, new Cesium.Cartesian3());
+    const rayLength = Cesium.Cartesian3.magnitude(rayDirection);
+    const rayNormalized = Cesium.Cartesian3.normalize(rayDirection, new Cesium.Cartesian3());
+
+    // ===== 第一步：射线拾取检测（3D Tiles 建筑） =====
+    const ray = new Cesium.Ray(this.startPoint, rayNormalized);
+    const pickResult = this.viewer.scene.pickFromRay(ray, {
+      maximumDistance: rayLength,
+      include: [Cesium.Cesium3DTileFeature]
+    });
+
+    if (pickResult) {
+      const hitDistance = Cesium.Cartesian3.distance(this.startPoint, pickResult.position);
+      if (hitDistance < rayLength - 0.5) {
+        let occlusionType = '建筑';
+        if (pickResult.primitive && pickResult.primitive.constructor.name === 'Globe') {
+          occlusionType = '地形';
+        }
+        return {
+          isVisible: false,
+          occlusionPoint: pickResult.position,
+          occlusionType: occlusionType
+        };
+      }
+    }
+
+    // ===== 第二步：地形高程采样检测 =====
+    const sampleCount = 80;
+    const latStep = (endCarto.latitude - startCarto.latitude) / sampleCount;
+    const lonStep = (endCarto.longitude - startCarto.longitude) / sampleCount;
+    const startHeight = startCarto.height;
+    const endHeight = endCarto.height;
+
+    for (let i = 1; i < sampleCount; i++) {
+      const lon = startCarto.longitude + lonStep * i;
+      const lat = startCarto.latitude + latStep * i;
+      const sampleCarto = new Cesium.Cartographic(lon, lat, 0);
+
+      let terrainHeight = this.viewer.scene.globe.getHeight(sampleCarto);
+      if (!terrainHeight || terrainHeight < -1000) {
+        continue;
+      }
+
+      const ratio = i / sampleCount;
+      const expectedHeight = startHeight + (endHeight - startHeight) * ratio;
+
+      if (terrainHeight > expectedHeight + 0.5) {
+        const occlusionPos = Cesium.Cartesian3.fromRadians(lon, lat, terrainHeight);
+        return {
+          isVisible: false,
+          occlusionPoint: occlusionPos,
+          occlusionType: '地形'
+        };
+      }
+    }
+
+    return {
+      isVisible: true,
+      occlusionPoint: null,
+      occlusionType: ''
+    };
+  }
+
+  // ----- 绘制通视线 -----
+  drawVisibilityLine(isVisible) {
+    // 先清除旧的通视线
+    if (this.analysisPrimitive) {
+      this.viewer.scene.primitives.remove(this.analysisPrimitive);
+      this.analysisPrimitive = null;
+    }
+    // 清除旧的虚线
+    this._dashEntities.forEach(e => this.viewer.entities.remove(e));
+    this._dashEntities = [];
+
+    const positions = [this.startPoint, this.endPoint];
+    const color = isVisible ? Cesium.Color.GREEN : Cesium.Color.RED;
+
+    this.analysisPrimitive = new Cesium.Primitive({
+      geometryInstances: new Cesium.GeometryInstance({
+        geometry: new Cesium.PolylineGeometry({
+          positions: positions,
+          width: 4,
+          vertexFormat: Cesium.PolylineColorAppearance.VERTEX_FORMAT,
+          arcType: Cesium.ArcType.NONE
+        }),
+        attributes: {
+          color: Cesium.ColorGeometryInstanceAttribute.fromColor(
+            color.withAlpha(0.8)
+          )
+        }
+      }),
+      appearance: new Cesium.PolylineColorAppearance({
+        translucent: true
+      })
+    });
+    this.viewer.scene.primitives.add(this.analysisPrimitive);
+
+    // 不可见时添加红色虚线辅助线
+    if (!isVisible) {
+      const dashEntity = this.viewer.entities.add({
+        polyline: {
+          positions: positions,
+          width: 2,
+          material: new Cesium.PolylineDashMaterialProperty({
+            color: Cesium.Color.RED.withAlpha(0.4),
+            dashLength: 16,
+            gapColor: Cesium.Color.TRANSPARENT
+          }),
+          clampToGround: false
+        }
+      });
+      this._dashEntities.push(dashEntity);
+    }
+  }
+
+  // ----- 执行通视分析（自动清除旧结果） -----
+  performAnalysis() {
+    if (this.analysisInProgress) return null;
+    this.analysisInProgress = true;
+
+    // 【关键优化】执行分析前，先清除所有旧的分析结果
+    this.clearAnalysisResults();
+
+    const analysisResult = this.checkLineOfSight();
+    this.drawVisibilityLine(analysisResult.isVisible);
+
+    if (!analysisResult.isVisible && analysisResult.occlusionPoint) {
+      this.occlusionPoint = analysisResult.occlusionPoint;
+
+      // 绘制遮挡点
+      const pointCollection = new Cesium.PointPrimitiveCollection();
+      pointCollection.add({
+        position: this.occlusionPoint,
+        pixelSize: 18,
+        color: Cesium.Color.YELLOW,
+        outlineColor: Cesium.Color.ORANGE,
+        outlineWidth: 3,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY
+      });
+      this.occlusionPrimitive = this.viewer.scene.primitives.add(pointCollection);
+
+      // 添加遮挡点标签
+      const labelEntity = this.viewer.entities.add({
+        position: this.occlusionPoint,
+        label: {
+          text: '🚫 遮挡点',
+          font: '14px sans-serif',
+          fillColor: Cesium.Color.YELLOW,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 2,
+          pixelOffset: new Cesium.Cartesian2(0, -30),
+          showBackground: true,
+          backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
+          backgroundPadding: new Cesium.Cartesian2(8, 4)
+        }
+      });
+      this._occlusionLabels.push(labelEntity);
+    }
+
+    this.analysisInProgress = false;
+    return {
+      isVisible: analysisResult.isVisible,
+      occlusionPoint: this.occlusionPoint,
+      occlusionType: analysisResult.occlusionType
+    };
+  }
+
+  // ----- 清空所有 -----
+  clear() {
+    this.clearAll();
+  }
+}
+
+// ================================================================
+//  3. 实例化并绑定 UI
+// ================================================================
+
+const visibilityAnalyzer = new VisibilityAnalyzer(viewer);
+
+const selectStartBtn = document.getElementById('selectStartBtn');
+const selectEndBtn = document.getElementById('selectEndBtn');
+const analysisBtn = document.getElementById('analysisBtn');
+const clearBtn = document.getElementById('clearBtn');
+const resultTip = document.getElementById('resultTip');
+const occlusionTip = document.getElementById('occlusionTip');
+
+let isSelectingStart = false;
+let isSelectingEnd = false;
+
+// ----- 更新提示状态 -----
+function setTip(text, className = '', detail = '') {
+  resultTip.className = 'tip-text' + (className ? ' ' + className : '');
+  const dotMatch = resultTip.innerHTML.match(/<span class="status-dot[^"]*"><\/span>/);
+  const dotHtml = dotMatch ? dotMatch[0] : '<span class="status-dot idle"></span>';
+  resultTip.innerHTML = dotHtml + ' ' + text;
+  occlusionTip.textContent = detail || '';
+}
+
+function setStatusDot(className) {
+  const dot = resultTip.querySelector('.status-dot');
+  if (dot) {
+    dot.className = 'status-dot ' + className;
+  }
+}
+
+// ----- 选择起点 -----
+selectStartBtn.addEventListener('click', () => {
+  // 清除旧的分析结果，但保留起点终点标记（如果有）
+  visibilityAnalyzer.clearAnalysisResults();
+  // 重置 UI 状态
+  analysisBtn.disabled = true;
+  occlusionTip.textContent = '';
+
+  isSelectingStart = true;
+  isSelectingEnd = false;
+  selectStartBtn.disabled = true;
+  selectEndBtn.disabled = true;
+  viewer.canvas.style.cursor = 'crosshair';
+  setTip('请在场景中点击选择通视分析起点', 'loading-tip');
+  setStatusDot('selecting');
+});
+
+// ----- 选择终点 -----
+selectEndBtn.addEventListener('click', () => {
+  if (!visibilityAnalyzer.getStartPoint()) {
+    setTip('请先选择起点！', 'error-tip');
+    return;
+  }
+  // 清除旧的分析结果，但保留起点终点标记
+  visibilityAnalyzer.clearAnalysisResults();
+  analysisBtn.disabled = true;
+  occlusionTip.textContent = '';
+
+  isSelectingEnd = true;
+  isSelectingStart = false;
+  selectEndBtn.disabled = true;
+  selectStartBtn.disabled = true;
+  viewer.canvas.style.cursor = 'crosshair';
+  setTip('请在场景中点击选择通视分析终点', 'loading-tip');
+  setStatusDot('selecting');
+});
+
+// ----- 执行分析 -----
+analysisBtn.addEventListener('click', () => {
+  if (!visibilityAnalyzer.getStartPoint() || !visibilityAnalyzer.getEndPoint()) {
+    setTip('请先选择起点和终点！', 'error-tip');
+    return;
+  }
+
+  setTip('正在执行通视分析...', 'loading-tip');
+  setStatusDot('selecting');
+
+  setTimeout(() => {
+    const result = visibilityAnalyzer.performAnalysis();
+    if (result && result.isVisible) {
+      setTip('✅ 通视分析结果：起点到终点 <span class="highlight">可见</span>', 'success-tip');
+      setStatusDot('ready');
+      occlusionTip.textContent = '🎉 视线通畅，无遮挡';
+    } else if (result) {
+      const type = result.occlusionType || '未知';
+      setTip(`❌ 通视分析结果：起点到终点被 <span class="highlight">${type}</span> 遮挡`, 'error-tip');
+      setStatusDot('error');
+      if (result.occlusionPoint) {
+        const carto = Cesium.Cartographic.fromCartesian(result.occlusionPoint);
+        const lng = Cesium.Math.toDegrees(carto.longitude).toFixed(6);
+        const lat = Cesium.Math.toDegrees(carto.latitude).toFixed(6);
+        occlusionTip.textContent = `📍 遮挡位置：经度 ${lng}，纬度 ${lat}，高程 ${carto.height.toFixed(1)} 米`;
+      } else {
+        occlusionTip.textContent = '📍 遮挡位置无法精确定位';
+      }
+    } else {
+      setTip('通视分析失败，请重试', 'error-tip');
+      setStatusDot('error');
+    }
+    selectStartBtn.disabled = false;
+    selectEndBtn.disabled = false;
+    viewer.canvas.style.cursor = 'default';
+  }, 150);
+});
+
+// ----- 清空 -----
+clearBtn.addEventListener('click', () => {
+  visibilityAnalyzer.clearAll();
+  isSelectingStart = false;
+  isSelectingEnd = false;
+  selectStartBtn.disabled = false;
+  selectEndBtn.disabled = true;
+  analysisBtn.disabled = true;
+  viewer.canvas.style.cursor = 'default';
+  setTip('已清空所有分析结果，请重新选择起点', '');
+  setStatusDot('idle');
+  occlusionTip.textContent = '';
+});
+
+// ----- 鼠标点击事件（选择点） -----
+viewer.screenSpaceEventHandler.setInputAction((event) => {
+  const ray = viewer.camera.getPickRay(event.position);
+  const pickResult = viewer.scene.pick(event.position);
+  let cartesian = null;
+
+  if (pickResult && pickResult.position) {
+    cartesian = pickResult.position;
+  } else if (ray) {
+    cartesian = viewer.scene.globe.pick(ray, viewer.scene);
+  }
+
+  if (!cartesian) {
+    cartesian = viewer.camera.pickEllipsoid(event.position);
+  }
+  if (!cartesian) return;
+
+  if (isSelectingStart) {
+    visibilityAnalyzer.setStartPoint(cartesian);
+    isSelectingStart = false;
+    viewer.canvas.style.cursor = 'default';
+    selectStartBtn.disabled = false;
+    selectEndBtn.disabled = false;
+    setTip('✅ 起点已选择，点击「选择终点」继续', 'success-tip');
+    setStatusDot('ready');
+  } else if (isSelectingEnd) {
+    visibilityAnalyzer.setEndPoint(cartesian);
+    isSelectingEnd = false;
+    viewer.canvas.style.cursor = 'default';
+    selectEndBtn.disabled = false;
+    analysisBtn.disabled = false;
+    setTip('✅ 终点已选择，点击「执行分析」开始通视分析', 'success-tip');
+    setStatusDot('ready');
+  }
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+// ----- 初始状态 -----
+setTip('点击「选择起点」在地图上标记起点', '');
+setStatusDot('idle');
+selectEndBtn.disabled = true;
+analysisBtn.disabled = true;
+
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+console.log('✅ Cesium 通视分析工具已加载（自动清除优化版）');
+console.log('📖 使用说明: 选择起点 → 选择终点 → 执行分析');
+console.log('🔄 每次执行新分析会自动清除上一次的结果');
+</script>
+<style>
+ /* ===== 全局重置 ===== */
+ * {
+   margin: 0;
+   padding: 0;
+   box-sizing: border-box;
+ }
+
+ html,
+ body {
+   width: 100%;
+   height: 100%;
+   overflow: hidden;
+   font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+ }
+
+ #cesiumContainer {
+   width: 100%;
+   height: 100%;
+   position: relative;
+ }
+
+ /* ===== 顶部控制面板 ===== */
+ .control-panel {
+   position: absolute;
+   top: 20px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.82);
+   backdrop-filter: blur(12px);
+   padding: 16px 24px;
+   border-radius: 16px;
+   border: 1px solid rgba(255, 255, 255, 0.08);
+   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+   display: flex;
+   align-items: center;
+   gap: 12px;
+   flex-wrap: wrap;
+   justify-content: center;
+   min-width: 280px;
+ }
+
+ .control-panel button {
+   padding: 8px 18px;
+   border: none;
+   border-radius: 8px;
+   font-size: 13px;
+   font-weight: 600;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+   white-space: nowrap;
+ }
+
+ .control-panel button:disabled {
+   opacity: 0.4;
+   cursor: not-allowed;
+   transform: none !important;
+ }
+
+ .control-panel button:active:not(:disabled) {
+   transform: scale(0.95);
+ }
+
+ .btn-start {
+   background: #00aaff;
+   color: #fff;
+ }
+
+ .btn-start:hover:not(:disabled) {
+   background: #0099ee;
+   box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+ }
+
+ .btn-start.active {
+   background: #ff6b35;
+   animation: pulse 1.2s infinite;
+ }
+
+ .btn-start.active:hover:not(:disabled) {
+   background: #e55a2b;
+ }
+
+ .btn-end {
+   background: #ff6b6b;
+   color: #fff;
+ }
+
+ .btn-end:hover:not(:disabled) {
+   background: #e55a5a;
+   box-shadow: 0 0 20px rgba(255, 107, 107, 0.3);
+ }
+
+ .btn-analyze {
+   background: #ffd700;
+   color: #222;
+ }
+
+ .btn-analyze:hover:not(:disabled) {
+   background: #f0c800;
+   box-shadow: 0 0 20px rgba(255, 215, 0, 0.3);
+ }
+
+ .btn-clear {
+   background: rgba(255, 255, 255, 0.08);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+ }
+
+ .btn-clear:hover:not(:disabled) {
+   background: rgba(255, 60, 60, 0.2);
+   color: #ff6b6b;
+   border-color: #ff6b6b;
+ }
+
+ @keyframes pulse {
+
+   0%,
+   100% {
+     box-shadow: 0 0 0 0 rgba(255, 107, 53, 0.4);
+   }
+
+   50% {
+     box-shadow: 0 0 0 12px rgba(255, 107, 53, 0);
+   }
+ }
+
+ /* ===== 结果提示区域 ===== */
+ .result-area {
+   position: absolute;
+   bottom: 100px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 100;
+   display: flex;
+   flex-direction: column;
+   align-items: center;
+   gap: 6px;
+   pointer-events: none;
+   width: 90%;
+   max-width: 600px;
+ }
+
+ .tip-text {
+   background: rgba(0, 0, 0, 0.75);
+   backdrop-filter: blur(8px);
+   color: #aaa;
+   padding: 10px 24px;
+   border-radius: 30px;
+   font-size: 14px;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+   text-align: center;
+   transition: all 0.4s ease;
+   width: 100%;
+ }
+
+ .tip-text.success-tip {
+   color: #00ff88;
+   border-color: rgba(0, 255, 136, 0.3);
+   background: rgba(0, 255, 136, 0.1);
+ }
+
+ .tip-text.error-tip {
+   color: #ff6b6b;
+   border-color: rgba(255, 107, 107, 0.3);
+   background: rgba(255, 107, 107, 0.1);
+ }
+
+ .tip-text.loading-tip {
+   color: #ffd700;
+   border-color: rgba(255, 215, 0, 0.2);
+   background: rgba(255, 215, 0, 0.05);
+ }
+
+ .tip-text .highlight {
+   color: #ffd700;
+   font-weight: 600;
+ }
+
+ .occlusion-detail {
+   color: #ff8844;
+   font-size: 13px;
+   background: rgba(0, 0, 0, 0.6);
+   backdrop-filter: blur(4px);
+   padding: 6px 16px;
+   border-radius: 20px;
+   border: 1px solid rgba(255, 136, 68, 0.15);
+ }
+
+ /* ===== 状态指示器 ===== */
+ .status-dot {
+   display: inline-block;
+   width: 10px;
+   height: 10px;
+   border-radius: 50%;
+   margin-right: 6px;
+   vertical-align: middle;
+ }
+
+ .status-dot.idle {
+   background: #666;
+ }
+
+ .status-dot.selecting {
+   background: #ffd700;
+   animation: blink 0.8s infinite;
+ }
+
+ .status-dot.ready {
+   background: #00ff88;
+ }
+
+ .status-dot.error {
+   background: #ff6b6b;
+ }
+
+ @keyframes blink {
+
+   0%,
+   100% {
+     opacity: 1;
+   }
+
+   50% {
+     opacity: 0.2;
+   }
+ }
+
+ .cesium-viewer-cesiumCreditContainer {
+   display: none !important;
+ }
+
+ @media (max-width: 768px) {
+   .control-panel {
+     top: 12px;
+     padding: 10px 14px;
+     gap: 8px;
+     min-width: unset;
+     width: 94%;
+     border-radius: 12px;
+   }
+
+   .control-panel button {
+     font-size: 11px;
+     padding: 6px 12px;
+   }
+
+   .tip-text {
+     font-size: 12px;
+     padding: 8px 16px;
+   }
+
+   .result-area {
+     bottom: 80px;
+   }
+ }
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
