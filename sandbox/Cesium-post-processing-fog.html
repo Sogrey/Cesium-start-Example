@@ -1,0 +1,633 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/19 01:09:31
+页面标题: Cesium 后处理雾效果
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 后处理雾效果</title>
+<meta name="description" content="实现了一个可直接运行的雾效果示例，包含完整的控制界面，支持实时调节雾的起始距离、结束距离、雾浓度和颜色。" />
+<template>
+<div id="cesiumContainer"></div>
+
+<!-- ===== 状态栏 ===== -->
+<div class="status-bar" id="statusBar">
+  🌫️ 雾效果: <span class="fog-status" id="fogStatus">关闭</span>
+</div>
+
+<!-- ===== 控制面板 ===== -->
+<div class="control-panel">
+  <button class="btn-toggle" id="toggleBtn">🌫️ 开启雾效果</button>
+
+  <div class="slider-group">
+    <label>起始距离 <input type="range" id="startSlider" min="0" max="5000" step="100" value="500">
+      <span class="value" id="startValue">500</span></label>
+  </div>
+  <div class="slider-group">
+    <label>结束距离 <input type="range" id="endSlider" min="1000" max="20000" step="500" value="8000">
+      <span class="value" id="endValue">8000</span></label>
+  </div>
+  <div class="slider-group">
+    <label>浓度 <input type="range" id="densitySlider" min="0" max="1.0" step="0.05" value="0.6">
+      <span class="value" id="densityValue">0.60</span></label>
+  </div>
+
+  <div class="color-picker-group">
+    <label>颜色 <input type="color" id="colorPicker" value="#d4d4d4"></label>
+  </div>
+
+  <button class="btn-preset" data-preset="light" style="background:rgba(255,255,255,0.08);color:#ccc;border:1px solid rgba(255,255,255,0.06);font-size:12px;padding:6px 14px;border-radius:8px;cursor:pointer;">☁️ 薄雾</button>
+  <button class="btn-preset" data-preset="moderate" style="background:rgba(255,255,255,0.08);color:#ccc;border:1px solid rgba(255,255,255,0.06);font-size:12px;padding:6px 14px;border-radius:8px;cursor:pointer;">🌫️ 中雾</button>
+  <button class="btn-preset" data-preset="heavy" style="background:rgba(255,255,255,0.08);color:#ccc;border:1px solid rgba(255,255,255,0.06);font-size:12px;padding:6px 14px;border-radius:8px;cursor:pointer;">🌁 浓雾</button>
+  <button class="btn-preset" data-preset="foggy" style="background:rgba(255,255,255,0.08);color:#ccc;border:1px solid rgba(255,255,255,0.06);font-size:12px;padding:6px 14px;border-radius:8px;cursor:pointer;">🏙️ 城市雾</button>
+</div>
+</template>
+<script>
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+// 添加高德影像底图
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+viewer.camera.setView({
+  destination: Cesium.Cartesian3.fromDegrees(116.3974, 39.9093, 3000),
+  orientation: {
+    heading: Cesium.Math.toRadians(0),
+    pitch: Cesium.Math.toRadians(-35),
+    roll: 0
+  }
+});
+
+// ================================================================
+//  2. 雾效果类（基于 PostProcessStage）
+// ================================================================
+class FogEffect {
+  constructor(viewer) {
+    this._viewer = viewer;
+    this._postProcessStage = null;
+    this._isEnabled = false;
+
+    // 默认参数
+    this._params = {
+      startDistance: 500,
+      startDensity: 0.0,
+      endDistance: 8000,
+      endDensity: 0.6,
+      color: new Cesium.Color(0.83, 0.83, 0.83, 1.0) // #d4d4d4
+    };
+
+    this._createStage();
+  }
+
+  // ----- 创建后处理阶段 -----
+  _createStage() {
+    const fragmentShader = `
+                    uniform sampler2D colorTexture;
+                    uniform sampler2D depthTexture;
+                    uniform vec4 fogByDistance;
+                    uniform vec4 fogColor;
+                    in vec2 v_textureCoordinates;
+                    out vec4 fragColor;
+
+                    // 1. 距离计算函数
+                    float getDistance(sampler2D depthTexture, vec2 texCoords) {
+                        float depth = czm_unpackDepth(texture(depthTexture, texCoords));
+                        if (depth == 0.0) {
+                            return czm_infinity;
+                        }
+                        vec4 eyeCoordinate = czm_windowToEyeCoordinates(gl_FragCoord.xy, depth);
+                        return -eyeCoordinate.z / eyeCoordinate.w;
+                    }
+
+                    // 2. 距离插值函数
+                    float interpolateByDistance(vec4 nearFarScalar, float distance) {
+                        float startDistance = nearFarScalar.x;
+                        float startValue = nearFarScalar.y;
+                        float endDistance = nearFarScalar.z;
+                        float endValue = nearFarScalar.w;
+                        float t = clamp((distance - startDistance) / (endDistance - startDistance), 0.0, 1.0);
+                        return mix(startValue, endValue, t);
+                    }
+
+                    // 3. Alpha混合函数
+                    vec4 alphaBlend(vec4 sourceColor, vec4 destinationColor) {
+                        return sourceColor * vec4(sourceColor.aaa, 1.0) + destinationColor * (1.0 - sourceColor.a);
+                    }
+
+                    void main(void) {
+                        float distance = getDistance(depthTexture, v_textureCoordinates);
+                        vec4 sceneColor = texture(colorTexture, v_textureCoordinates);
+
+                        // 计算雾混合强度
+                        float blendAmount = interpolateByDistance(fogByDistance, distance);
+                        vec4 finalFogColor = vec4(fogColor.rgb, fogColor.a * blendAmount);
+
+                        fragColor = alphaBlend(finalFogColor, sceneColor);
+                    }
+                `;
+
+    this._postProcessStage = new Cesium.PostProcessStage({
+      name: 'fogEffect',
+      fragmentShader: fragmentShader,
+      uniforms: {
+        fogByDistance: new Cesium.Cartesian4(
+          this._params.startDistance,
+          this._params.startDensity,
+          this._params.endDistance,
+          this._params.endDensity
+        ),
+        fogColor: this._params.color
+      }
+    });
+
+    this._postProcessStage.enabled = false;
+    this._viewer.scene.postProcessStages.add(this._postProcessStage);
+  }
+
+  // ----- 控制方法 -----
+  enable() {
+    if (this._postProcessStage && !this._postProcessStage.enabled) {
+      this._postProcessStage.enabled = true;
+      this._isEnabled = true;
+    }
+  }
+
+  disable() {
+    if (this._postProcessStage && this._postProcessStage.enabled) {
+      this._postProcessStage.enabled = false;
+      this._isEnabled = false;
+    }
+  }
+
+  toggle() {
+    if (this._isEnabled) {
+      this.disable();
+    } else {
+      this.enable();
+    }
+    return this._isEnabled;
+  }
+
+  isEnabled() {
+    return this._isEnabled;
+  }
+
+  // ----- 参数设置 -----
+  setStartDistance(value) {
+    this._params.startDistance = Math.max(0, value);
+    this._updateUniforms();
+  }
+
+  setEndDistance(value) {
+    this._params.endDistance = Math.max(100, value);
+    this._updateUniforms();
+  }
+
+  setDensity(value) {
+    this._params.endDensity = Math.max(0, Math.min(1.0, value));
+    this._updateUniforms();
+  }
+
+  setColor(hexColor) {
+    const color = Cesium.Color.fromCssColorString(hexColor);
+    this._params.color = color;
+    if (this._postProcessStage) {
+      this._postProcessStage.uniforms.fogColor = color;
+    }
+  }
+
+  _updateUniforms() {
+    if (this._postProcessStage) {
+      this._postProcessStage.uniforms.fogByDistance = new Cesium.Cartesian4(
+        this._params.startDistance,
+        this._params.startDensity,
+        this._params.endDistance,
+        this._params.endDensity
+      );
+    }
+  }
+
+  // ----- 预设场景 -----
+  applyPreset(preset) {
+    const presets = {
+      light: {
+        start: 100,
+        end: 3000,
+        density: 0.3,
+        color: '#e8e8e8'
+      },
+      moderate: {
+        start: 200,
+        end: 5000,
+        density: 0.5,
+        color: '#d4d4d4'
+      },
+      heavy: {
+        start: 50,
+        end: 2000,
+        density: 0.8,
+        color: '#c0c0c0'
+      },
+      foggy: {
+        start: 300,
+        end: 8000,
+        density: 0.6,
+        color: '#b8b8b8'
+      }
+    };
+
+    const p = presets[preset];
+    if (!p) return;
+
+    this.setStartDistance(p.start);
+    this.setEndDistance(p.end);
+    this.setDensity(p.density);
+    this.setColor(p.color);
+
+    if (!this._isEnabled) {
+      this.enable();
+    }
+
+    return this._params;
+  }
+
+  // ----- 销毁 -----
+  destroy() {
+    if (this._postProcessStage) {
+      this._viewer.scene.postProcessStages.remove(this._postProcessStage);
+      this._postProcessStage = null;
+    }
+    this._isEnabled = false;
+  }
+}
+
+// ================================================================
+//  3. 实例化并绑定 UI
+// ================================================================
+
+const fogEffect = new FogEffect(viewer);
+
+// DOM 元素
+const toggleBtn = document.getElementById('toggleBtn');
+const fogStatus = document.getElementById('fogStatus');
+
+const startSlider = document.getElementById('startSlider');
+const endSlider = document.getElementById('endSlider');
+const densitySlider = document.getElementById('densitySlider');
+const colorPicker = document.getElementById('colorPicker');
+
+const startValue = document.getElementById('startValue');
+const endValue = document.getElementById('endValue');
+const densityValue = document.getElementById('densityValue');
+
+const presetBtns = document.querySelectorAll('.btn-preset');
+
+// ----- 更新状态显示 -----
+function updateStatus() {
+  const enabled = fogEffect.isEnabled();
+  fogStatus.textContent = enabled ? '开启 🌫️' : '关闭';
+  fogStatus.className = 'fog-status' + (enabled ? ' active' : '');
+  toggleBtn.textContent = enabled ? '⏹ 关闭雾效果' : '🌫️ 开启雾效果';
+  toggleBtn.className = 'btn-toggle' + (enabled ? ' active' : '');
+}
+
+// ----- 更新滑块显示 -----
+function updateSliderDisplay() {
+  startValue.textContent = parseInt(startSlider.value);
+  endValue.textContent = parseInt(endSlider.value);
+  densityValue.textContent = parseFloat(densitySlider.value).toFixed(2);
+}
+
+// ----- 滑块事件绑定 -----
+startSlider.addEventListener('input', function() {
+  const val = parseInt(this.value);
+  fogEffect.setStartDistance(val);
+  updateSliderDisplay();
+});
+
+endSlider.addEventListener('input', function() {
+  const val = parseInt(this.value);
+  fogEffect.setEndDistance(val);
+  updateSliderDisplay();
+});
+
+densitySlider.addEventListener('input', function() {
+  const val = parseFloat(this.value);
+  fogEffect.setDensity(val);
+  updateSliderDisplay();
+});
+
+// ----- 颜色选择 -----
+colorPicker.addEventListener('input', function() {
+  fogEffect.setColor(this.value);
+});
+
+// ----- 切换按钮 -----
+toggleBtn.addEventListener('click', function() {
+  fogEffect.toggle();
+  updateStatus();
+});
+
+// ----- 预设场景 -----
+presetBtns.forEach(btn => {
+  btn.addEventListener('click', function() {
+    const preset = this.dataset.preset;
+    const params = fogEffect.applyPreset(preset);
+
+    if (params) {
+      startSlider.value = params.startDistance;
+      endSlider.value = params.endDistance;
+      densitySlider.value = params.endDensity;
+      // 尝试从颜色中提取十六进制
+      const hex = params.color.toCssColorString();
+      if (hex) colorPicker.value = hex;
+      updateSliderDisplay();
+      updateStatus();
+    }
+  });
+});
+
+// ----- 初始状态 -----
+updateStatus();
+updateSliderDisplay();
+
+// 窗口 resize
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+// ================================================================
+//  4. 控制台帮助信息
+// ================================================================
+console.log('✅ Cesium 后处理雾效果已加载');
+console.log('📖 使用说明:');
+console.log('  - 点击「开启雾效果」切换');
+console.log('  - 拖动滑块调节参数');
+console.log('  - 点击预设快速切换场景');
+console.log('🌫️ 预设场景: 薄雾 | 中雾 | 浓雾 | 城市雾');
+console.log('💡 提示: 雾效果基于深度纹理实现，性能开销极低');
+</script>
+<style>
+ /* ===== 全局重置 ===== */
+ * {
+   margin: 0;
+   padding: 0;
+   box-sizing: border-box;
+ }
+
+ html,
+ body {
+   width: 100%;
+   height: 100%;
+   overflow: hidden;
+   font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+ }
+
+ #cesiumContainer {
+   width: 100%;
+   height: 100%;
+   position: relative;
+ }
+
+ /* ===== 控制面板 ===== */
+ .control-panel {
+   position: absolute;
+   bottom: 30px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.82);
+   backdrop-filter: blur(12px);
+   padding: 16px 24px;
+   border-radius: 16px;
+   border: 1px solid rgba(255, 255, 255, 0.08);
+   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+   display: flex;
+   align-items: center;
+   gap: 14px;
+   flex-wrap: wrap;
+   justify-content: center;
+   min-width: 280px;
+   max-width: 95%;
+ }
+
+ .control-panel button {
+   padding: 8px 20px;
+   border: none;
+   border-radius: 8px;
+   font-size: 13px;
+   font-weight: 600;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+ }
+
+ .control-panel button:active {
+   transform: scale(0.95);
+ }
+
+ .btn-toggle {
+   background: #aaa;
+   color: #fff;
+ }
+
+ .btn-toggle:hover {
+   background: #999;
+   box-shadow: 0 0 20px rgba(170, 170, 170, 0.3);
+ }
+
+ .btn-toggle.active {
+   background: #ff8844;
+   animation: pulse 1.2s infinite;
+ }
+
+ .btn-toggle.active:hover {
+   background: #ee7733;
+ }
+
+ @keyframes pulse {
+
+   0%,
+   100% {
+     box-shadow: 0 0 0 0 rgba(255, 136, 68, 0.4);
+   }
+
+   50% {
+     box-shadow: 0 0 0 12px rgba(255, 136, 68, 0);
+   }
+ }
+
+ /* ===== 滑块控制区 ===== */
+ .slider-group {
+   display: flex;
+   align-items: center;
+   gap: 6px;
+   color: #aaa;
+   font-size: 12px;
+   flex-wrap: wrap;
+ }
+
+ .slider-group label {
+   display: flex;
+   align-items: center;
+   gap: 4px;
+   white-space: nowrap;
+ }
+
+ .slider-group input[type="range"] {
+   width: 70px;
+   height: 4px;
+   -webkit-appearance: none;
+   background: rgba(255, 255, 255, 0.2);
+   border-radius: 2px;
+   outline: none;
+ }
+
+ .slider-group input[type="range"]::-webkit-slider-thumb {
+   -webkit-appearance: none;
+   width: 14px;
+   height: 14px;
+   border-radius: 50%;
+   background: #ff8844;
+   cursor: pointer;
+ }
+
+ .slider-group .value {
+   color: #ff8844;
+   font-weight: 600;
+   min-width: 28px;
+   text-align: center;
+ }
+
+ /* ===== 颜色选择器 ===== */
+ .color-picker-group {
+   display: flex;
+   align-items: center;
+   gap: 6px;
+   color: #aaa;
+   font-size: 12px;
+ }
+
+ .color-picker-group input[type="color"] {
+   width: 30px;
+   height: 30px;
+   border: 2px solid rgba(255, 255, 255, 0.2);
+   border-radius: 6px;
+   cursor: pointer;
+   background: none;
+   padding: 0;
+ }
+
+ .color-picker-group input[type="color"]::-webkit-color-swatch-wrapper {
+   padding: 2px;
+ }
+
+ .color-picker-group input[type="color"]::-webkit-color-swatch {
+   border: none;
+   border-radius: 4px;
+ }
+
+ /* ===== 状态栏 ===== */
+ .status-bar {
+   position: absolute;
+   top: 20px;
+   right: 20px;
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.7);
+   backdrop-filter: blur(8px);
+   padding: 10px 16px;
+   border-radius: 10px;
+   color: #aaa;
+   font-size: 12px;
+   border: 1px solid rgba(255, 255, 255, 0.05);
+   font-family: monospace;
+   pointer-events: none;
+ }
+
+ .status-bar .fog-status {
+   color: #aaa;
+ }
+
+ .status-bar .fog-status.active {
+   color: #ffd700;
+ }
+
+ .cesium-viewer-cesiumCreditContainer {
+   display: none !important;
+ }
+
+ @media (max-width: 768px) {
+   .control-panel {
+     bottom: 12px;
+     padding: 10px 12px;
+     gap: 8px;
+     width: 96%;
+     border-radius: 12px;
+   }
+
+   .control-panel button {
+     font-size: 11px;
+     padding: 5px 12px;
+   }
+
+   .slider-group input[type="range"] {
+     width: 50px;
+   }
+
+   .slider-group {
+     font-size: 10px;
+   }
+
+   .status-bar {
+     top: 12px;
+     right: 12px;
+     padding: 6px 10px;
+     font-size: 10px;
+   }
+ }
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
