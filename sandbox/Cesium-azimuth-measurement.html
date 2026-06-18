@@ -1,0 +1,853 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/19 00:13:01
+页面标题: Cesium 方位角测量
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 方位角测量</title>
+<meta name="description" content="在三维GIS与数字孪生应用中，方位角测量是描述方向、规划路径的核心工具。本文基于Cesium引擎，详细解析方位角测量的数学原理、技术实现与完整代码，涵盖从坐标转换到可视化交互的全流程。" />
+<template>
+<div id="cesiumContainer"></div>
+
+<div class="measure-panel" id="measurePanel">
+  <div class="title">🧭 方位角测量</div>
+  <div id="measureContent">
+    <div class="empty">点击「开始测量」后<br>在地图上点击两个点</div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <button class="btn-start" id="startBtn">▶ 开始测量</button>
+  <button class="btn-clear" id="clearBtn">🗑 清除</button>
+  <button class="btn-export" id="exportBtn">📥 导出数据</button>
+</div>
+
+<div class="hint" id="hint">💡 点击第一个点（起点）→ 移动鼠标预览方位角 → 点击第二个点（终点）完成测量</div>
+</template>
+<script>
+// ================================================================
+//  0. 初始化 Cesium Ion (必须，用于访问地形服务)
+// ================================================================
+// Cesium Ion 默认访问令牌 (公开的示例令牌，仅用于演示)
+// 建议到 https://cesium.com/ion/ 注册并替换为自己的令牌
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  baseLayer: false,
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+viewer.camera.setView({
+  destination: Cesium.Cartesian3.fromDegrees(116.3974, 39.9093, 2000),
+  orientation: {
+    heading: 0,
+    pitch: Cesium.Math.toRadians(-35),
+    roll: 0
+  }
+});
+
+// ================================================================
+//  2. 方位角测量工具类（修复 isActive 问题）
+// ================================================================
+class CesiumAngleUtil {
+  constructor() {
+    this.dynamicEntities = [];
+    this.staticEntities = [];
+    this.positions = [];
+    this.viewer = null;
+    this.handler = null;
+    this._isActive = false; // 【修复】使用私有属性
+    this.callback = null;
+    this.hasStartPoint = false;
+  }
+
+  // 【修复】使用 getter 方法返回状态
+  isActive() {
+    return this._isActive;
+  }
+
+  cartesianToLngLat(cartesian) {
+    const cartographic = this.viewer.scene.globe.ellipsoid.cartesianToCartographic(cartesian);
+    return [
+      Cesium.Math.toDegrees(cartographic.longitude),
+      Cesium.Math.toDegrees(cartographic.latitude)
+    ];
+  }
+
+  getCartesianFromPixel(pixel) {
+    const pickedObject = this.viewer.scene.pick(pixel);
+    if (this.viewer.scene.pickPositionSupported && Cesium.defined(pickedObject)) {
+      const cartesian = this.viewer.scene.pickPosition(pixel);
+      if (cartesian) {
+        const cartographic = this.viewer.scene.globe.ellipsoid.cartesianToCartographic(cartesian);
+        if (cartographic.height > 0) {
+          return cartesian;
+        }
+      }
+    }
+    const pickRay = this.viewer.scene.camera.getPickRay(pixel);
+    return this.viewer.scene.globe.pick(pickRay, this.viewer.scene);
+  }
+
+  calculateDistance(pointPositions) {
+    if (pointPositions.length < 2) return 0;
+    const p1 = Cesium.Cartographic.fromCartesian(pointPositions[0]);
+    const p2 = Cesium.Cartographic.fromCartesian(pointPositions[1]);
+    const geodesic = new Cesium.EllipsoidGeodesic();
+    geodesic.setEndPoints(p1, p2);
+    const surfaceDistance = geodesic.surfaceDistance;
+    const heightDiff = p2.height - p1.height;
+    return Math.sqrt(Math.pow(surfaceDistance, 2) + Math.pow(heightDiff, 2));
+  }
+
+  calculateAzimuth(startLng, startLat, endLng, endLat) {
+    const localToWorldMatrix = Cesium.Transforms.eastNorthUpToFixedFrame(
+      new Cesium.Cartesian3.fromDegrees(startLng, startLat)
+    );
+    const worldToLocalMatrix = Cesium.Matrix4.inverse(
+      localToWorldMatrix,
+      new Cesium.Matrix4()
+    );
+    const localPosA = Cesium.Matrix4.multiplyByPoint(
+      worldToLocalMatrix,
+      new Cesium.Cartesian3.fromDegrees(startLng, startLat),
+      new Cesium.Cartesian3()
+    );
+    const localPosB = Cesium.Matrix4.multiplyByPoint(
+      worldToLocalMatrix,
+      new Cesium.Cartesian3.fromDegrees(endLng, endLat),
+      new Cesium.Cartesian3()
+    );
+    const angleRad = Math.atan2(
+      localPosB.x - localPosA.x,
+      localPosB.y - localPosA.y
+    );
+    let angleDeg = angleRad * (180 / Math.PI);
+    if (angleDeg < 0) angleDeg += 360;
+    return angleDeg;
+  }
+
+  // ----- 图形绘制 -----
+  createDynamicEntities() {
+    const that = this;
+    const entities = [];
+
+    const arrowEntity = this.viewer.entities.add({
+      polyline: {
+        positions: new Cesium.CallbackProperty(() => {
+          if (that.positions.length < 2) return null;
+          return that.positions;
+        }, false),
+        clampToGround: true,
+        material: new Cesium.PolylineArrowMaterialProperty(
+          Cesium.Color.fromCssColorString("#FFFF33").withAlpha(1.0)
+        ),
+        width: 10
+      }
+    });
+    entities.push(arrowEntity);
+
+    const floatLineEntity = this.viewer.entities.add({
+      polyline: {
+        positions: new Cesium.CallbackProperty(() => {
+          if (that.positions.length < 2) return null;
+          const startCartographic = Cesium.Cartographic.fromCartesian(that.positions[0]);
+          const distance = that.calculateDistance(that.positions);
+          const endPoint = Cesium.Cartesian3.fromRadians(
+            startCartographic.longitude,
+            startCartographic.latitude + distance / 111000 * (Math.PI / 180),
+            startCartographic.height
+          );
+          return [that.positions[0], endPoint];
+        }, false),
+        clampToGround: true,
+        material: new Cesium.PolylineGlowMaterialProperty({
+          color: Cesium.Color.BLUE,
+          glowPower: 1
+        }),
+        width: 4
+      }
+    });
+    entities.push(floatLineEntity);
+
+    const labelEntity = this.viewer.entities.add({
+      position: new Cesium.CallbackProperty(() => {
+        if (that.positions.length < 2) return null;
+        return that.positions[1];
+      }, false),
+      label: {
+        text: new Cesium.CallbackProperty(() => {
+          if (that.positions.length < 2) return null;
+          const start = that.cartesianToLngLat(that.positions[0]);
+          const end = that.cartesianToLngLat(that.positions[1]);
+          const angle = that.calculateAzimuth(start[0], start[1], end[0], end[1]);
+          const dist = that.calculateDistance(that.positions);
+          return `方位角: ${angle.toFixed(1)}°\n斜距: ${dist.toFixed(1)}m`;
+        }, false),
+        font: "bold 16px sans-serif",
+        fillColor: Cesium.Color.GOLD,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        outlineWidth: 4,
+        outlineColor: Cesium.Color.BLACK,
+        verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+        pixelOffset: new Cesium.Cartesian2(20, -20),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
+        backgroundPadding: new Cesium.Cartesian2(8, 4)
+      }
+    });
+    entities.push(labelEntity);
+
+    const startPointEntity = this.viewer.entities.add({
+      position: new Cesium.CallbackProperty(() => {
+        if (that.positions.length < 1) return null;
+        return that.positions[0];
+      }, false),
+      point: {
+        pixelSize: 12,
+        color: Cesium.Color.RED,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2
+      },
+      label: {
+        text: new Cesium.CallbackProperty(() => {
+          if (that.positions.length < 1) return null;
+          return '起点';
+        }, false),
+        font: "14px sans-serif",
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        pixelOffset: new Cesium.Cartesian2(0, -28),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.5),
+        backgroundPadding: new Cesium.Cartesian2(6, 3)
+      }
+    });
+    entities.push(startPointEntity);
+
+    return entities;
+  }
+
+  createStaticEntities(positions, index) {
+    const that = this;
+    const start = this.cartesianToLngLat(positions[0]);
+    const end = this.cartesianToLngLat(positions[1]);
+    const angle = this.calculateAzimuth(start[0], start[1], end[0], end[1]);
+    const dist = this.calculateDistance(positions);
+    const entities = [];
+
+    const arrowEntity = this.viewer.entities.add({
+      polyline: {
+        positions: positions.slice(),
+        clampToGround: true,
+        material: new Cesium.PolylineArrowMaterialProperty(
+          Cesium.Color.fromCssColorString("#FF8800").withAlpha(0.9)
+        ),
+        width: 8
+      }
+    });
+    entities.push(arrowEntity);
+
+    const endPointEntity = this.viewer.entities.add({
+      position: positions[1],
+      point: {
+        pixelSize: 10,
+        color: Cesium.Color.BLUE,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2
+      }
+    });
+    entities.push(endPointEntity);
+
+    const labelEntity = this.viewer.entities.add({
+      position: positions[1],
+      label: {
+        text: `#${index} 方位角: ${angle.toFixed(1)}°\n斜距: ${dist.toFixed(1)}m`,
+        font: "bold 14px sans-serif",
+        fillColor: Cesium.Color.GOLD,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        outlineWidth: 3,
+        outlineColor: Cesium.Color.BLACK,
+        verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+        pixelOffset: new Cesium.Cartesian2(30, -30),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
+        backgroundPadding: new Cesium.Cartesian2(6, 4)
+      }
+    });
+    entities.push(labelEntity);
+
+    const startPointEntity = this.viewer.entities.add({
+      position: positions[0],
+      point: {
+        pixelSize: 10,
+        color: Cesium.Color.RED,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2
+      },
+      label: {
+        text: `起点 #${index}`,
+        font: "12px sans-serif",
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        pixelOffset: new Cesium.Cartesian2(0, -25),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.5),
+        backgroundPadding: new Cesium.Cartesian2(4, 2)
+      }
+    });
+    entities.push(startPointEntity);
+
+    this.staticEntities = this.staticEntities.concat(entities);
+    return entities;
+  }
+
+  // ----- 交互控制 -----
+  initDrawing() {
+    this.positions = [];
+    this.hasStartPoint = false;
+
+    this.dynamicEntities.forEach(entity => {
+      this.viewer.entities.remove(entity);
+    });
+    this.dynamicEntities = [];
+
+    if (!this.handler) {
+      this.handler = new Cesium.ScreenSpaceEventHandler(this.viewer.scene.canvas);
+    }
+
+    // 左键点击
+    this.handler.setInputAction((event) => {
+      const cartesian = this.getCartesianFromPixel(event.position);
+      if (!cartesian) return;
+
+      if (!this.hasStartPoint) {
+        this.positions = [cartesian.clone()];
+        this.hasStartPoint = true;
+        this.dynamicEntities = this.createDynamicEntities();
+
+        if (typeof this.callback === 'function') {
+          this.callback({
+            status: 'start_set',
+            message: '已设置起点，请移动鼠标预览方位角'
+          });
+        }
+      } else {
+        if (this.positions.length >= 2) {
+          const start = this.cartesianToLngLat(this.positions[0]);
+          const end = this.cartesianToLngLat(this.positions[1]);
+          const angle = this.calculateAzimuth(start[0], start[1], end[0], end[1]);
+          const dist = this.calculateDistance(this.positions);
+          const index = (this.staticEntities.length / 4) + 1;
+
+          this.createStaticEntities(this.positions.slice(), index);
+
+          this.dynamicEntities.forEach(entity => {
+            this.viewer.entities.remove(entity);
+          });
+          this.dynamicEntities = [];
+
+          if (typeof this.callback === 'function') {
+            this.callback({
+              status: 'complete',
+              azimuth: angle,
+              distance: dist,
+              startPoint: start,
+              endPoint: end,
+              index: index
+            });
+          }
+
+          this.positions = [];
+          this.hasStartPoint = false;
+
+          this.handler.destroy();
+          this.handler = null;
+          this.initDrawing();
+        }
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    // 鼠标移动
+    this.handler.setInputAction((event) => {
+      if (!this.hasStartPoint || this.positions.length === 0) return;
+
+      const cartesian = this.getCartesianFromPixel(event.endPosition);
+      if (!cartesian) return;
+
+      if (this.positions.length === 1) {
+        this.positions.push(cartesian.clone());
+      } else {
+        this.positions[1] = cartesian.clone();
+      }
+
+      if (typeof this.callback === 'function' && this.positions.length === 2) {
+        const start = this.cartesianToLngLat(this.positions[0]);
+        const end = this.cartesianToLngLat(this.positions[1]);
+        const angle = this.calculateAzimuth(start[0], start[1], end[0], end[1]);
+        const dist = this.calculateDistance(this.positions);
+        this.callback({
+          status: 'preview',
+          azimuth: angle,
+          distance: dist,
+          startPoint: start,
+          endPoint: end
+        });
+      }
+    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+  }
+
+  // ----- 生命周期管理 -----
+  activate(viewer, callback) {
+    if (this._isActive) return;
+    this.viewer = viewer;
+    this.callback = callback || null;
+    this._isActive = true;
+    this.initDrawing();
+  }
+
+  deactivate() {
+    this.clearAll();
+    this.viewer = null;
+    this._isActive = false;
+    this.callback = null;
+  }
+
+  clearAll() {
+    this.dynamicEntities.forEach(entity => {
+      this.viewer.entities.remove(entity);
+    });
+    this.dynamicEntities = [];
+
+    this.staticEntities.forEach(entity => {
+      this.viewer.entities.remove(entity);
+    });
+    this.staticEntities = [];
+
+    this.positions = [];
+    this.hasStartPoint = false;
+
+    if (this.handler) {
+      this.handler.destroy();
+      this.handler = null;
+    }
+  }
+}
+
+// ================================================================
+//  3. 实例化并绑定 UI
+// ================================================================
+
+const angleUtil = new CesiumAngleUtil();
+
+const startBtn = document.getElementById('startBtn');
+const clearBtn = document.getElementById('clearBtn');
+const exportBtn = document.getElementById('exportBtn');
+const measureContent = document.getElementById('measureContent');
+const hint = document.getElementById('hint');
+
+let measureHistory = [];
+
+function updateMeasureDisplay(result) {
+  if (!result) {
+    measureContent.innerHTML = `
+                        <div class="empty">点击「开始测量」后<br>在地图上点击两个点</div>
+                    `;
+    return;
+  }
+
+  if (result.status === 'preview') {
+    measureContent.innerHTML = `
+                        <div class="row"><span class="label">🧭 方位角</span><span class="value azimuth">${result.azimuth.toFixed(1)} °</span></div>
+                        <div class="row"><span class="label">📏 斜距</span><span class="value distance">${result.distance.toFixed(1)} 米</span></div>
+                        <div class="row" style="margin-top:4px;border-top:1px solid rgba(255,255,255,0.06);padding-top:4px;">
+                            <span class="label preview">👆 点击确定终点</span>
+                        </div>
+                    `;
+  } else if (result.status === 'complete') {
+    measureContent.innerHTML = `
+                        <div class="row"><span class="label">🧭 方位角</span><span class="value azimuth">${result.azimuth.toFixed(1)} °</span></div>
+                        <div class="row"><span class="label">📏 斜距</span><span class="value distance">${result.distance.toFixed(1)} 米</span></div>
+                        <div class="row" style="margin-top:6px;border-top:1px solid rgba(255,255,255,0.06);padding-top:6px;">
+                            <span class="label" style="font-size:11px;color:#888;">✅ 第 ${result.index} 次测量完成</span>
+                        </div>
+                    `;
+  } else if (result.status === 'start_set') {
+    measureContent.innerHTML = `
+                        <div class="row"><span class="label" style="color:#ff8844;">📍 起点已设置</span></div>
+                        <div class="row"><span class="label preview">🔄 移动鼠标预览方位角</span></div>
+                    `;
+  }
+}
+
+startBtn.addEventListener('click', function() {
+  // 【修复】使用 isActive() 方法
+  if (angleUtil.isActive()) {
+    angleUtil.deactivate();
+    this.classList.remove('active');
+    this.innerHTML = '▶ 开始测量';
+    hint.classList.remove('hidden');
+    hint.textContent = '💡 已停止测量，点击「开始测量」重新启动';
+    updateMeasureDisplay(null);
+  } else {
+    angleUtil.activate(viewer, function(result) {
+      if (result.status === 'complete') {
+        measureHistory.push({
+          azimuth: result.azimuth,
+          distance: result.distance,
+          startPoint: result.startPoint,
+          endPoint: result.endPoint,
+          index: result.index
+        });
+        updateMeasureDisplay(result);
+        hint.textContent = '✅ 测量完成！继续点击下一个起点...';
+        hint.classList.remove('hidden');
+        setTimeout(() => {
+          hint.textContent = '💡 点击第一个点（起点）→ 移动预览 → 点击第二个点（终点）';
+        }, 1500);
+      } else if (result.status === 'preview') {
+        updateMeasureDisplay(result);
+      } else if (result.status === 'start_set') {
+        updateMeasureDisplay(result);
+        hint.textContent = '📍 起点已设置，移动鼠标预览方位角，点击确定终点';
+      }
+    });
+    this.classList.add('active');
+    this.innerHTML = '⏹ 停止测量';
+    hint.classList.remove('hidden');
+    hint.textContent = '💡 点击第一个点（起点）→ 移动鼠标预览方位角 → 点击第二个点（终点）完成测量';
+    updateMeasureDisplay(null);
+  }
+});
+
+clearBtn.addEventListener('click', function() {
+  angleUtil.clearAll();
+  angleUtil.deactivate();
+  startBtn.classList.remove('active');
+  startBtn.innerHTML = '▶ 开始测量';
+  measureHistory = [];
+  updateMeasureDisplay(null);
+  hint.classList.remove('hidden');
+  hint.textContent = '🗑 已清除所有测量数据';
+  setTimeout(() => {
+    hint.textContent = '💡 点击「开始测量」后在地图上点击两个点';
+  }, 1500);
+});
+
+exportBtn.addEventListener('click', function() {
+  if (measureHistory.length === 0) {
+    alert('暂无测量数据可导出');
+    return;
+  }
+
+  const data = {
+    exportTime: new Date().toISOString(),
+    totalCount: measureHistory.length,
+    measurements: measureHistory.map((item) => ({
+      index: item.index,
+      azimuth: parseFloat(item.azimuth.toFixed(1)),
+      distance: parseFloat(item.distance.toFixed(1)),
+      startPoint: item.startPoint,
+      endPoint: item.endPoint
+    }))
+  };
+
+  const json = JSON.stringify(data, null, 2);
+  const blob = new Blob([json], {
+    type: 'application/json'
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `方位角测量数据_${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  hint.textContent = `📥 已导出 ${measureHistory.length} 条测量数据`;
+  hint.classList.remove('hidden');
+  setTimeout(() => {
+    hint.textContent = '💡 点击「开始测量」后在地图上点击两个点';
+  }, 2000);
+});
+
+updateMeasureDisplay(null);
+
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+console.log('✅ Cesium 方位角测量工具已加载（最终修复版）');
+console.log('📖 交互流程: 点击起点 → 移动鼠标预览 → 点击终点完成');
+</script>
+<style>
+ * {
+   margin: 0;
+   padding: 0;
+   box-sizing: border-box;
+ }
+
+ html,
+ body {
+   width: 100%;
+   height: 100%;
+   overflow: hidden;
+   font-family: 'Microsoft YaHei', sans-serif;
+ }
+
+ #cesiumContainer {
+   width: 100%;
+   height: 100%;
+   position: relative;
+ }
+
+ .toolbar {
+   position: absolute;
+   bottom: 30px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 100;
+   display: flex;
+   align-items: center;
+   gap: 12px;
+   background: rgba(0, 0, 0, 0.78);
+   backdrop-filter: blur(12px);
+   padding: 12px 24px;
+   border-radius: 16px;
+   border: 1px solid rgba(255, 255, 255, 0.1);
+   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+   flex-wrap: wrap;
+   justify-content: center;
+ }
+
+ .toolbar button {
+   padding: 8px 20px;
+   border: none;
+   border-radius: 8px;
+   font-size: 14px;
+   font-weight: 600;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   display: flex;
+   align-items: center;
+   gap: 6px;
+   font-family: inherit;
+ }
+
+ .btn-start {
+   background: #00aaff;
+   color: #fff;
+ }
+
+ .btn-start:hover {
+   background: #0099ee;
+   box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+ }
+
+ .btn-start.active {
+   background: #ff6b35;
+   animation: pulse 1.2s infinite;
+ }
+
+ .btn-start.active:hover {
+   background: #e55a2b;
+ }
+
+ .btn-clear {
+   background: rgba(255, 255, 255, 0.1);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.08);
+ }
+
+ .btn-clear:hover {
+   background: rgba(255, 60, 60, 0.2);
+   color: #ff6b6b;
+   border-color: #ff6b6b;
+ }
+
+ .btn-export {
+   background: rgba(255, 215, 0, 0.12);
+   color: #ffd700;
+   border: 1px solid rgba(255, 215, 0, 0.15);
+ }
+
+ .btn-export:hover {
+   background: rgba(255, 215, 0, 0.2);
+ }
+
+ @keyframes pulse {
+
+   0%,
+   100% {
+     box-shadow: 0 0 0 0 rgba(255, 107, 53, 0.4);
+   }
+
+   50% {
+     box-shadow: 0 0 0 12px rgba(255, 107, 53, 0);
+   }
+ }
+
+ .measure-panel {
+   position: absolute;
+   top: 20px;
+   right: 20px;
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.8);
+   backdrop-filter: blur(12px);
+   padding: 18px 24px;
+   border-radius: 14px;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+   min-width: 200px;
+   color: #eee;
+   font-size: 14px;
+   line-height: 1.8;
+ }
+
+ .measure-panel .title {
+   font-size: 13px;
+   color: #888;
+   letter-spacing: 2px;
+   margin-bottom: 6px;
+   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+   padding-bottom: 6px;
+ }
+
+ .measure-panel .row {
+   display: flex;
+   justify-content: space-between;
+   gap: 20px;
+ }
+
+ .measure-panel .label {
+   color: #999;
+ }
+
+ .measure-panel .value {
+   font-weight: 600;
+   font-family: 'Courier New', monospace;
+ }
+
+ .value.azimuth {
+   color: #ffd700;
+ }
+
+ .value.distance {
+   color: #66d9ff;
+ }
+
+ .value.preview {
+   color: #ff8844;
+   font-size: 12px;
+ }
+
+ .measure-panel .empty {
+   color: #666;
+   font-style: italic;
+   font-size: 13px;
+   text-align: center;
+   padding: 4px 0;
+ }
+
+ .hint {
+   position: absolute;
+   bottom: 100px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 99;
+   background: rgba(0, 0, 0, 0.6);
+   backdrop-filter: blur(8px);
+   color: #aaa;
+   padding: 8px 20px;
+   border-radius: 30px;
+   font-size: 13px;
+   border: 1px solid rgba(255, 255, 255, 0.05);
+   pointer-events: none;
+   transition: opacity 0.5s ease;
+   white-space: nowrap;
+ }
+
+ .hint.hidden {
+   opacity: 0;
+ }
+
+ .cesium-viewer-cesiumCreditContainer {
+   display: none !important;
+ }
+
+ @media (max-width: 768px) {
+   .toolbar {
+     bottom: 16px;
+     padding: 10px 14px;
+     gap: 8px;
+     width: 94%;
+     border-radius: 12px;
+   }
+
+   .toolbar button {
+     font-size: 12px;
+     padding: 6px 14px;
+   }
+
+   .measure-panel {
+     top: 12px;
+     right: 12px;
+     padding: 12px 16px;
+     min-width: 160px;
+     font-size: 12px;
+   }
+
+   .hint {
+     bottom: 80px;
+     font-size: 11px;
+     padding: 5px 14px;
+     white-space: normal;
+   }
+ }
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
