@@ -1,0 +1,672 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/19 13:44:08
+页面标题: Cesium 自定义图片+颜色材质 Polyline
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 自定义图片+颜色材质 Polyline</title>
+<meta name="description" content="实现了一个可直接运行的 Polyline 自定义材质示例，支持图片纹理 + 颜色混合的流动线条效果。当未选择图片时，使用 Canvas 动态生成的渐变图片作为纹理。" />
+<template>
+<div id="cesiumContainer"></div>
+
+<div class="status-bar" id="statusBar">
+  📊 线条数量: <span class="highlight" id="lineCount">0</span>
+  <span id="currentPreset"></span>
+</div>
+
+<div class="control-panel">
+  <button class="btn-add" id="addBtn">➕ 添加</button>
+  <button class="btn-clear" id="clearBtn">🗑 清除</button>
+
+  <div class="control-group">
+    <label>颜色 <input type="color" id="colorPicker" value="#00aaff"></label>
+  </div>
+  <div class="control-group">
+    <label>速度 <input type="range" id="speedSlider" min="0.1" max="3.0" step="0.1" value="1.0">
+      <span class="value" id="speedValue">1.0</span></label>
+  </div>
+  <div class="control-group">
+    <label>宽度 <input type="range" id="widthSlider" min="2" max="16" step="1" value="6">
+      <span class="value" id="widthValue">6</span></label>
+  </div>
+
+  <button class="btn-preset active-preset" data-preset="glow">✨ 发光</button>
+  <button class="btn-preset" data-preset="dash">📏 虚线</button>
+  <button class="btn-preset" data-preset="arrow">➡️ 箭头</button>
+  <button class="btn-preset" data-preset="outline">🔲 描边</button>
+</div>
+</template>
+<script type="module">
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+window.viewer = viewer
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+viewer.camera.setView({
+  destination: new Cesium.Cartesian3(-3676339.1704714987,6024323.1809824025,3282381.2840632224),
+  orientation: {
+    heading: 0,
+    pitch: Cesium.Math.toRadians(-65),
+    roll: 0
+  }
+});
+
+// ================================================================
+//  2. 弧线生成工具
+// ================================================================
+function generateArcPoints(startPoint, endPoint, curvatureFactor, pointCount) {
+  const result = [];
+  const startPos = Cesium.Cartographic.fromCartesian(startPoint);
+  const endPos = Cesium.Cartographic.fromCartesian(endPoint);
+
+  const startLon = startPos.longitude * 180 / Math.PI;
+  const startLat = startPos.latitude * 180 / Math.PI;
+  const endLon = endPos.longitude * 180 / Math.PI;
+  const endLat = endPos.latitude * 180 / Math.PI;
+
+  const distance = Math.sqrt(
+    (startLon - endLon) * (startLon - endLon) +
+    (startLat - endLat) * (startLat - endLat)
+  );
+  const curvature = distance * curvatureFactor;
+
+  const startVec = Cesium.Cartesian3.clone(startPoint);
+  const endVec = Cesium.Cartesian3.clone(endPoint);
+
+  const startLength = Cesium.Cartesian3.distance(startVec, Cesium.Cartesian3.ZERO);
+  const endLength = Cesium.Cartesian3.distance(endVec, Cesium.Cartesian3.ZERO);
+
+  Cesium.Cartesian3.normalize(startVec, startVec);
+  Cesium.Cartesian3.normalize(endVec, endVec);
+
+  if (Cesium.Cartesian3.distance(startVec, endVec) === 0) return result;
+
+  const omega = Cesium.Cartesian3.angleBetween(startVec, endVec);
+  result.push(startPoint);
+
+  for (let i = 1; i < pointCount - 1; i++) {
+    const t = i * 1.0 / (pointCount - 1);
+    const invT = 1.0 - t;
+
+    const startScalar = Math.sin(invT * omega) / Math.sin(omega);
+    const endScalar = Math.sin(t * omega) / Math.sin(omega);
+
+    const startScalarVec = Cesium.Cartesian3.multiplyByScalar(
+      startVec, startScalar, new Cesium.Cartesian3()
+    );
+    const endScalarVec = Cesium.Cartesian3.multiplyByScalar(
+      endVec, endScalar, new Cesium.Cartesian3()
+    );
+
+    let centerVec = Cesium.Cartesian3.add(startScalarVec, endScalarVec, new Cesium.Cartesian3());
+
+    const theta = t * Math.PI;
+    const currentLength = startLength * invT + endLength * t + Math.sin(theta) * curvature;
+
+    centerVec = Cesium.Cartesian3.multiplyByScalar(centerVec, currentLength, centerVec);
+    result.push(centerVec);
+  }
+
+  result.push(endPoint);
+  return result;
+}
+
+function generateRandomArc() {
+  const lng1 = 110 + Math.random() * 15;
+  const lat1 = 30 + Math.random() * 10;
+  const lng2 = 115 + Math.random() * 15;
+  const lat2 = 25 + Math.random() * 10;
+  const height1 = 1000 + Math.random() * 2000;
+  const height2 = 1000 + Math.random() * 2000;
+
+  const startPoint = Cesium.Cartesian3.fromDegrees(lng1, lat1, height1);
+  const endPoint = Cesium.Cartesian3.fromDegrees(lng2, lat2, height2);
+
+  const curvatureFactor = 0.3 + Math.random() * 0.4;
+  const pointCount = 50 + Math.floor(Math.random() * 30);
+  return generateArcPoints(startPoint, endPoint, curvatureFactor, pointCount);
+}
+
+// ================================================================
+//  3. 四种线型（全部使用内置材质）
+// ================================================================
+
+let lineEntities = [];
+let lineCount = 0;
+let currentPresetType = 'glow';
+const lineCountEl = document.getElementById('lineCount');
+const currentPresetEl = document.getElementById('currentPreset');
+
+function updateStatus(presetName) {
+  lineCountEl.textContent = lineCount;
+  currentPresetEl.textContent = presetName ? ' | ' + presetName : '';
+}
+
+function getParams() {
+  const color = document.getElementById('colorPicker').value;
+  const speed = parseFloat(document.getElementById('speedSlider').value);
+  const width = parseInt(document.getElementById('widthSlider').value);
+  return {
+    color,
+    speed,
+    width
+  };
+}
+
+// ----- 3.1 发光材质 -----
+function addGlowLine() {
+  const params = getParams();
+  const positions = generateRandomArc();
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  const material = new Cesium.PolylineGlowMaterialProperty({
+    glowPower: new Cesium.CallbackProperty(function(time) {
+      const t = (time.secondsOfDay * params.speed) % 1.0;
+      return 0.3 + 0.7 * (0.5 + 0.5 * Math.sin(t * Math.PI * 3));
+    }, false),
+    color: color
+  });
+
+  const entity = viewer.entities.add({
+    polyline: {
+      positions: positions,
+      width: params.width,
+      material: material,
+      clampToGround: false,
+      arcType: Cesium.ArcType.NONE
+    }
+  });
+
+  lineEntities.push({
+    entity,
+    material,
+    preset: '发光',
+    type: 'glow'
+  });
+  lineCount++;
+  updateStatus('发光');
+}
+
+// ----- 3.2 虚线材质 -----
+function addDashLine() {
+  const params = getParams();
+  const positions = generateRandomArc();
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  const material = new Cesium.PolylineDashMaterialProperty({
+    color: color,
+    dashLength: new Cesium.CallbackProperty(function(time) {
+      const t = (time.secondsOfDay * params.speed) % 1.0;
+      return 8 + 24 * t;
+    }, false),
+    gapColor: Cesium.Color.TRANSPARENT
+  });
+
+  const entity = viewer.entities.add({
+    polyline: {
+      positions: positions,
+      width: params.width,
+      material: material,
+      clampToGround: false,
+      arcType: Cesium.ArcType.NONE
+    }
+  });
+
+  lineEntities.push({
+    entity,
+    material,
+    preset: '虚线',
+    type: 'dash'
+  });
+  lineCount++;
+  updateStatus('虚线');
+}
+
+// ----- 3.3 箭头材质 -----
+function addArrowLine() {
+  const params = getParams();
+  const positions = generateRandomArc();
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  const material = new Cesium.PolylineArrowMaterialProperty(color);
+
+  const entity = viewer.entities.add({
+    polyline: {
+      positions: positions,
+      width: params.width,
+      material: material,
+      clampToGround: false,
+      arcType: Cesium.ArcType.NONE
+    }
+  });
+
+  lineEntities.push({
+    entity,
+    material,
+    preset: '箭头',
+    type: 'arrow'
+  });
+  lineCount++;
+  updateStatus('箭头');
+}
+
+// ----- 3.4 描边材质 -----
+function addOutlineLine() {
+  const params = getParams();
+  const positions = generateRandomArc();
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  const material = new Cesium.PolylineOutlineMaterialProperty({
+    color: color,
+    outlineColor: Cesium.Color.WHITE,
+    outlineWidth: 2
+  });
+
+  const entity = viewer.entities.add({
+    polyline: {
+      positions: positions,
+      width: params.width,
+      material: material,
+      clampToGround: false,
+      arcType: Cesium.ArcType.NONE
+    }
+  });
+
+  lineEntities.push({
+    entity,
+    material,
+    preset: '描边',
+    type: 'outline'
+  });
+  lineCount++;
+  updateStatus('描边');
+}
+
+// ================================================================
+//  4. 添加线条（根据当前选中的预设）
+// ================================================================
+
+function addLineByPreset() {
+  switch (currentPresetType) {
+    case 'glow':
+      addGlowLine();
+      break;
+    case 'dash':
+      addDashLine();
+      break;
+    case 'arrow':
+      addArrowLine();
+      break;
+    case 'outline':
+      addOutlineLine();
+      break;
+    default:
+      addGlowLine();
+  }
+}
+
+// ================================================================
+//  5. UI 事件绑定
+// ================================================================
+
+document.getElementById('addBtn').addEventListener('click', function() {
+  addLineByPreset();
+});
+
+document.querySelectorAll('.btn-preset').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.btn-preset').forEach(b => b.classList.remove('active-preset'));
+    this.classList.add('active-preset');
+    currentPresetType = this.dataset.preset;
+  });
+});
+
+document.getElementById('clearBtn').addEventListener('click', function() {
+  lineEntities.forEach(item => {
+    viewer.entities.remove(item.entity);
+  });
+  lineEntities = [];
+  lineCount = 0;
+  updateStatus();
+});
+
+// 速度滑块 - 更新所有线条的速度
+document.getElementById('speedSlider').addEventListener('input', function() {
+  const val = parseFloat(this.value);
+  document.getElementById('speedValue').textContent = val.toFixed(1);
+  // 由于使用 CallbackProperty，速度值会在下次渲染时自动生效
+});
+
+// 宽度滑块 - 实时更新
+document.getElementById('widthSlider').addEventListener('input', function() {
+  const val = parseInt(this.value);
+  document.getElementById('widthValue').textContent = val;
+  lineEntities.forEach(item => {
+    try {
+      if (item.entity && item.entity.polyline) {
+        item.entity.polyline.width = val;
+      }
+    } catch (e) {}
+  });
+});
+
+// 颜色选择器 - 更新所有线条的颜色
+document.getElementById('colorPicker').addEventListener('input', function() {
+  const color = Cesium.Color.fromCssColorString(this.value);
+  lineEntities.forEach(item => {
+    try {
+      if (item.material && typeof item.material.color !== 'undefined') {
+        item.material.color = color;
+      }
+    } catch (e) {}
+  });
+});
+
+// ================================================================
+//  6. 初始化示例
+// ================================================================
+
+setTimeout(() => {
+  const types = [{
+      fn: addGlowLine,
+      name: '发光'
+    },
+    {
+      fn: addDashLine,
+      name: '虚线'
+    },
+    {
+      fn: addArrowLine,
+      name: '箭头'
+    },
+    {
+      fn: addOutlineLine,
+      name: '描边'
+    }
+  ];
+  const colors = ['#00aaff', '#ff6600', '#00ff88', '#ffcc00'];
+  types.forEach((item, index) => {
+    setTimeout(() => {
+      document.getElementById('colorPicker').value = colors[index % colors.length];
+      item.fn();
+    }, index * 400);
+  });
+  setTimeout(() => {
+    document.getElementById('colorPicker').value = '#00aaff';
+  }, types.length * 400 + 200);
+}, 500);
+
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+console.log('✅ 四种线型已加载: 发光 | 虚线 | 箭头 | 描边');
+console.log('📖 点击预设切换线型，点击「添加」添加线条');
+console.log('💡 所有材质均为 Cesium 内置，无兼容性问题');
+</script>
+<style>
+ * {
+   margin: 0;
+   padding: 0;
+   box-sizing: border-box;
+ }
+
+ html,
+ body {
+   width: 100%;
+   height: 100%;
+   overflow: hidden;
+   font-family: 'Microsoft YaHei', sans-serif;
+ }
+
+ #cesiumContainer {
+   width: 100%;
+   height: 100%;
+   position: relative;
+ }
+
+ .control-panel {
+   position: absolute;
+   bottom: 30px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.85);
+   backdrop-filter: blur(12px);
+   padding: 16px 24px;
+   border-radius: 16px;
+   border: 1px solid rgba(255, 255, 255, 0.08);
+   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+   display: flex;
+   align-items: center;
+   gap: 10px;
+   flex-wrap: wrap;
+   justify-content: center;
+   max-width: 98%;
+ }
+
+ .control-panel button {
+   padding: 6px 14px;
+   border: none;
+   border-radius: 8px;
+   font-size: 12px;
+   font-weight: 600;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+   white-space: nowrap;
+ }
+
+ .control-panel button:active {
+   transform: scale(0.95);
+ }
+
+ .btn-add {
+   background: #00aaff;
+   color: #fff;
+ }
+
+ .btn-add:hover {
+   background: #0099ee;
+   box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+ }
+
+ .btn-clear {
+   background: rgba(255, 255, 255, 0.08);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+ }
+
+ .btn-clear:hover {
+   background: rgba(255, 60, 60, 0.2);
+   color: #ff6b6b;
+   border-color: #ff6b6b;
+ }
+
+ .control-group {
+   display: flex;
+   align-items: center;
+   gap: 6px;
+   color: #aaa;
+   font-size: 11px;
+   flex-wrap: wrap;
+ }
+
+ .control-group label {
+   display: flex;
+   align-items: center;
+   gap: 3px;
+   white-space: nowrap;
+ }
+
+ .control-group input[type="color"] {
+   width: 24px;
+   height: 24px;
+   border: 2px solid rgba(255, 255, 255, 0.2);
+   border-radius: 6px;
+   cursor: pointer;
+   background: none;
+   padding: 0;
+ }
+
+ .control-group input[type="color"]::-webkit-color-swatch-wrapper {
+   padding: 2px;
+ }
+
+ .control-group input[type="color"]::-webkit-color-swatch {
+   border: none;
+   border-radius: 4px;
+ }
+
+ .control-group input[type="range"] {
+   width: 50px;
+   height: 4px;
+   -webkit-appearance: none;
+   background: rgba(255, 255, 255, 0.2);
+   border-radius: 2px;
+   outline: none;
+ }
+
+ .control-group input[type="range"]::-webkit-slider-thumb {
+   -webkit-appearance: none;
+   width: 12px;
+   height: 12px;
+   border-radius: 50%;
+   background: #00aaff;
+   cursor: pointer;
+ }
+
+ .control-group .value {
+   color: #00aaff;
+   font-weight: 600;
+   min-width: 24px;
+   text-align: center;
+ }
+
+ .btn-preset {
+   background: rgba(255, 255, 255, 0.08);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+   font-size: 11px;
+   padding: 5px 12px;
+   border-radius: 8px;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+ }
+
+ .btn-preset:hover {
+   background: rgba(255, 255, 255, 0.18);
+   color: #fff;
+ }
+
+ .btn-preset.active-preset {
+   border-color: #00aaff;
+   color: #00aaff;
+   background: rgba(0, 170, 255, 0.15);
+ }
+
+ .status-bar {
+   position: absolute;
+   top: 20px;
+   right: 20px;
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.7);
+   backdrop-filter: blur(8px);
+   padding: 10px 16px;
+   border-radius: 10px;
+   color: #aaa;
+   font-size: 12px;
+   border: 1px solid rgba(255, 255, 255, 0.05);
+   font-family: monospace;
+   pointer-events: none;
+   max-width: 300px;
+ }
+
+ .status-bar .highlight {
+   color: #00aaff;
+   font-weight: 600;
+ }
+
+ .cesium-viewer-cesiumCreditContainer {
+   display: none !important;
+ }
+
+ @media (max-width: 768px) {
+   .control-panel {
+     bottom: 12px;
+     padding: 8px 10px;
+     gap: 6px;
+     width: 98%;
+     border-radius: 12px;
+   }
+
+   .control-panel button {
+     font-size: 10px;
+     padding: 4px 10px;
+   }
+
+   .control-group input[type="range"] {
+     width: 35px;
+   }
+
+   .control-group {
+     font-size: 10px;
+   }
+
+   .status-bar {
+     top: 12px;
+     right: 12px;
+     padding: 6px 10px;
+     font-size: 10px;
+     max-width: 200px;
+   }
+ }
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
