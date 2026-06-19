@@ -1,0 +1,601 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/19 13:25:25
+页面标题: Cesium 流动飞线特效
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 流动飞线特效</title>
+<meta name="description" content="在三维GIS与数字孪生应用中，**流动飞线**是数据流、航线、迁徙路径等动态信息的可视化利器。" />
+<template>
+<div id="cesiumContainer"></div>
+
+<div class="status-bar" id="statusBar">
+  📊 线条数量: <span class="highlight" id="lineCount">0</span>
+  <span id="currentPreset"></span>
+</div>
+
+<div class="control-panel">
+  <button class="btn-add" id="addBtn">➕ 添加飞线</button>
+  <button class="btn-clear" id="clearBtn">🗑 清除</button>
+
+  <div class="control-group">
+    <label>颜色 <input type="color" id="colorPicker" value="#00ff88"></label>
+  </div>
+  <div class="control-group">
+    <label>速度 <input type="range" id="speedSlider" min="0.1" max="3.0" step="0.1" value="1.0">
+      <span class="value" id="speedValue">1.0</span></label>
+  </div>
+  <div class="control-group">
+    <label>宽度 <input type="range" id="widthSlider" min="2" max="20" step="1" value="6">
+      <span class="value" id="widthValue">6</span></label>
+  </div>
+</div>
+</template>
+<script>
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+// ================================================================
+//  2. 贝塞尔曲线算法（原文 setPathData）
+// ================================================================
+
+// 组合数计算
+function erxiangshi(start, end) {
+  let cs = 1,
+    bcs = 1;
+  while (end > 0) {
+    cs *= start;
+    bcs *= end;
+    start--;
+    end--;
+  }
+  return cs / bcs;
+}
+
+// 多点贝塞尔
+function multiPointBezier(points, t) {
+  let len = points.length;
+  let x = 0,
+    y = 0;
+  for (let i = 0; i < len; i++) {
+    let point = points[i];
+    x += point.x * Math.pow(1 - t, len - 1 - i) * Math.pow(t, i) * erxiangshi(len - 1, i);
+    y += point.y * Math.pow(1 - t, len - 1 - i) * Math.pow(t, i) * erxiangshi(len - 1, i);
+  }
+  return {
+    x: x,
+    y: y
+  };
+}
+
+// 创建贝塞尔点集
+function createBezierPoints(anchorpoints, pointsAmount) {
+  let points = [];
+  for (let i = 0; i < pointsAmount; i++) {
+    let point = multiPointBezier(anchorpoints, i / pointsAmount);
+    points.push([point.x, point.y]);
+  }
+  return points;
+}
+
+// 获取贝塞尔曲线路径点（经纬度）
+function getBSRPoints(x1, y1, x2, y2, h) {
+  let pointStart = [y1, 0];
+  let pointEnd = [(y2 + y1) / 2, h];
+  let point3 = [y2, 0];
+  let ps = [{
+      x: pointStart[0],
+      y: pointStart[1]
+    },
+    {
+      x: pointEnd[0],
+      y: pointEnd[1]
+    },
+    {
+      x: point3[0],
+      y: point3[1]
+    }
+  ];
+  let arr = createBezierPoints(ps, 100);
+
+  let arr3d = [];
+  for (let i = 0; i < arr.length; i++) {
+    let x = ((x2 - x1) * (arr[i][0] - y1)) / (y2 - y1) + x1;
+    arr3d.push([x, arr[i][0], arr[i][1]]);
+  }
+  return arr3d;
+}
+
+// 转换为 Cesium.Cartesian3 数组
+function setPathData(startLon, startLat, endLon, endLat, height) {
+  let arr3d = getBSRPoints(startLon, startLat, endLon, endLat, height);
+  let arrAll = [];
+  for (let ite of arr3d) {
+    arrAll.push(ite[0]);
+    arrAll.push(ite[1]);
+    arrAll.push(ite[2]);
+  }
+  return Cesium.Cartesian3.fromDegreesArrayHeights(arrAll);
+}
+
+// ================================================================
+//  3. GLSL 着色器（原文 FlowingLineMaterialGLSL）
+// ================================================================
+
+const FlowingLineMaterialGLSL =
+  'float SPEED_STEP = 0.01; \n' +
+  'vec4 drawLight(float xPos, vec2 st, float headOffset, float tailOffset, float widthOffset){ \n' +
+  '  float lineLength = smoothstep(xPos + headOffset, xPos, st.x) - smoothstep(xPos, xPos - tailOffset, st.x); \n' +
+  '  float lineWidth = smoothstep(widthOffset, 0.5, st.y) - smoothstep(0.5, 1.0 - widthOffset, st.y); \n' +
+  '  return vec4(lineLength * lineWidth); \n' +
+  '}\n' +
+  'czm_material czm_getMaterial(czm_materialInput materialInput) \n' +
+  '{ \n' +
+  '  czm_material m = czm_getDefaultMaterial(materialInput);\n' +
+  '  float sinTime = sin(czm_frameNumber * SPEED_STEP * speed); \n' +
+  '  vec4 v4_core;\n' +
+  '  vec4 v4_color;\n' +
+  '  float xPos = 0.0; \n' +
+  '  if (sinTime < 0.0){ \n' +
+  '    xPos = cos(czm_frameNumber * SPEED_STEP * speed)+ 1.0 - tailsize; \n' +
+  '  }else{ \n' +
+  '    xPos = -cos(czm_frameNumber * SPEED_STEP * speed)+ 1.0 - tailsize; \n' +
+  '  } \n' +
+  '  v4_color = drawLight(xPos, materialInput.st, headsize, tailsize, widthoffset);\n' +
+  '  v4_core = drawLight(xPos, materialInput.st, coresize, coresize*2.0, widthoffset*2.0);\n' +
+  '  m.diffuse = color.xyz + v4_core.xyz*v4_core.w*0.8; \n' +
+  '  m.alpha = pow(v4_color.w, 3.0); \n' +
+  '  return m; \n' +
+  '} \n';
+
+// ================================================================
+//  4. 飞线管理
+// ================================================================
+
+let primitives = [];
+let lineCount = 0;
+let firstFly = true;
+const lineCountEl = document.getElementById('lineCount');
+const currentPresetEl = document.getElementById('currentPreset');
+
+function updateStatus(presetName) {
+  lineCountEl.textContent = lineCount;
+  currentPresetEl.textContent = presetName ? ' | ' + presetName : '';
+}
+
+function getParams() {
+  return {
+    color: document.getElementById('colorPicker').value,
+    speed: parseFloat(document.getElementById('speedSlider').value),
+    width: parseInt(document.getElementById('widthSlider').value)
+  };
+}
+
+// ================================================================
+//  4.1 添加飞线（原文方式）
+// ================================================================
+
+function addFlowLine() {
+  const params = getParams();
+
+  // 广州 → 深圳
+  const positions = setPathData(113.17, 23.8, 114.0, 22.5, 80000);
+
+  // ---- 创建飞线材质 ----
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  const material = new Cesium.Material({
+    fabric: {
+      type: 'FlowingLineMaterial',
+      uniforms: {
+        color: color,
+        speed: params.speed * 1.5,
+        headsize: 0.05,
+        tailsize: 0.5,
+        widthoffset: 0.1,
+        coresize: 0.05
+      },
+      source: FlowingLineMaterialGLSL
+    }
+  });
+
+  // ---- 创建飞线 Primitive ----
+  const primitive = new Cesium.Primitive({
+    geometryInstances: new Cesium.GeometryInstance({
+      geometry: new Cesium.PolylineGeometry({
+        positions: positions,
+        width: params.width,
+        vertexFormat: Cesium.VertexFormat.ALL
+      })
+    }),
+    appearance: new Cesium.PolylineMaterialAppearance({
+      material: material,
+      translucent: true
+    })
+  });
+
+  viewer.scene.primitives.add(primitive);
+
+  // 保存引用
+  const item = {
+    primitive: primitive,
+    material: material,
+    positions: positions,
+    params: params
+  };
+  primitives.push(item);
+
+  lineCount++;
+  updateStatus('流动飞线');
+
+  if (firstFly) {
+    firstFly = false;
+    const center = positions[Math.floor(positions.length / 2)];
+    viewer.camera.flyTo({
+      destination: center,
+      orientation: {
+        heading: Cesium.Math.toRadians(0),
+        pitch: Cesium.Math.toRadians(-35),
+        roll: 0
+      },
+      duration: 1.5,
+      distance: 120000
+    });
+  }
+}
+
+// ================================================================
+//  5. UI 事件绑定
+// ================================================================
+
+document.getElementById('addBtn').addEventListener('click', function() {
+  addFlowLine();
+});
+
+document.getElementById('clearBtn').addEventListener('click', function() {
+  primitives.forEach(item => {
+    viewer.scene.primitives.remove(item.primitive);
+  });
+  primitives = [];
+  lineCount = 0;
+  firstFly = true;
+  updateStatus();
+});
+
+// ---- 更新参数 ----
+function updateAllLines() {
+  const params = getParams();
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  const oldItems = primitives.slice();
+  primitives = [];
+
+  oldItems.forEach(item => {
+    viewer.scene.primitives.remove(item.primitive);
+
+    // 重新创建材质
+    const newMaterial = new Cesium.Material({
+      fabric: {
+        type: 'FlowingLineMaterial',
+        uniforms: {
+          color: color,
+          speed: params.speed * 1.5,
+          headsize: 0.05,
+          tailsize: 0.5,
+          widthoffset: 0.1,
+          coresize: 0.05
+        },
+        source: FlowingLineMaterialGLSL
+      }
+    });
+
+    const newPrimitive = new Cesium.Primitive({
+      geometryInstances: new Cesium.GeometryInstance({
+        geometry: new Cesium.PolylineGeometry({
+          positions: item.positions,
+          width: params.width,
+          vertexFormat: Cesium.VertexFormat.ALL
+        })
+      }),
+      appearance: new Cesium.PolylineMaterialAppearance({
+        material: newMaterial,
+        translucent: true
+      })
+    });
+
+    viewer.scene.primitives.add(newPrimitive);
+
+    primitives.push({
+      primitive: newPrimitive,
+      material: newMaterial,
+      positions: item.positions,
+      params: params
+    });
+  });
+
+  updateStatus('流动飞线');
+}
+
+document.getElementById('speedSlider').addEventListener('input', function() {
+  document.getElementById('speedValue').textContent = parseFloat(this.value).toFixed(1);
+  updateAllLines();
+});
+
+document.getElementById('widthSlider').addEventListener('input', function() {
+  document.getElementById('widthValue').textContent = this.value;
+  updateAllLines();
+});
+
+document.getElementById('colorPicker').addEventListener('input', function() {
+  updateAllLines();
+});
+
+// ================================================================
+//  6. 初始化示例
+// ================================================================
+
+setTimeout(() => {
+  addFlowLine();
+  setTimeout(() => {
+    document.getElementById('colorPicker').value = '#ff6633';
+    addFlowLine();
+    document.getElementById('colorPicker').value = '#00ff88';
+  }, 400);
+}, 500);
+
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+console.log('✅ 流动飞线已加载（原文正确实现）');
+console.log('📖 实现方式:');
+console.log('  - 使用 Cesium.Material 创建自定义材质');
+console.log('  - 使用 PolylineMaterialAppearance');
+console.log('  - 使用 VertexFormat.ALL');
+console.log('  - 着色器: FlowingLineMaterialGLSL');
+console.log('  - 贝塞尔曲线: setPathData');
+</script>
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: 'Microsoft YaHei', sans-serif;
+}
+
+#cesiumContainer {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.control-panel {
+  position: absolute;
+  bottom: 30px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(12px);
+  padding: 16px 24px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 98%;
+}
+
+.control-panel button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.25s ease;
+  font-family: inherit;
+  white-space: nowrap;
+}
+
+.control-panel button:active {
+  transform: scale(0.95);
+}
+
+.btn-add {
+  background: #00aaff;
+  color: #fff;
+}
+
+.btn-add:hover {
+  background: #0099ee;
+  box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+}
+
+.btn-clear {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ccc;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.btn-clear:hover {
+  background: rgba(255, 60, 60, 0.2);
+  color: #ff6b6b;
+  border-color: #ff6b6b;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #aaa;
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+
+.control-group label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+.control-group input[type="color"] {
+  width: 24px;
+  height: 24px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  cursor: pointer;
+  background: none;
+  padding: 0;
+}
+
+.control-group input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+.control-group input[type="color"]::-webkit-color-swatch {
+  border: none;
+  border-radius: 4px;
+}
+
+.control-group input[type="range"] {
+  width: 50px;
+  height: 4px;
+  -webkit-appearance: none;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+  outline: none;
+}
+
+.control-group input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #00aaff;
+  cursor: pointer;
+}
+
+.control-group .value {
+  color: #00aaff;
+  font-weight: 600;
+  min-width: 24px;
+  text-align: center;
+}
+
+.status-bar {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  padding: 10px 16px;
+  border-radius: 10px;
+  color: #aaa;
+  font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  font-family: monospace;
+  pointer-events: none;
+  max-width: 300px;
+}
+
+.status-bar .highlight {
+  color: #00aaff;
+  font-weight: 600;
+}
+
+.cesium-viewer-cesiumCreditContainer {
+  display: none !important;
+}
+
+@media (max-width: 768px) {
+  .control-panel {
+    bottom: 12px;
+    padding: 8px 10px;
+    gap: 6px;
+    width: 98%;
+    border-radius: 12px;
+  }
+
+  .control-panel button {
+    font-size: 10px;
+    padding: 4px 10px;
+  }
+
+  .control-group input[type="range"] {
+    width: 35px;
+  }
+
+  .control-group {
+    font-size: 10px;
+  }
+
+  .status-bar {
+    top: 12px;
+    right: 12px;
+    padding: 6px 10px;
+    font-size: 10px;
+    max-width: 200px;
+  }
+}
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
