@@ -1,6 +1,6 @@
 <!--
 CodeSandbox 分享文件
-生成时间: 2026/6/19 13:25:25
+生成时间: 2026/6/19 13:37:02
 页面标题: Cesium 流动飞线特效
 原始页面链接: https://sogrey.top/CodeSandbox/
 -->
@@ -53,6 +53,7 @@ const viewer = new Cesium.Viewer('cesiumContainer', {
   selectionIndicator: true,
   terrainProvider: new Cesium.EllipsoidTerrainProvider()
 });
+window.viewer = viewer
 
 if (viewer.cesiumWidget.creditContainer) {
   viewer.cesiumWidget.creditContainer.style.display = 'none';
@@ -267,7 +268,7 @@ function addFlowLine() {
     firstFly = false;
     const center = positions[Math.floor(positions.length / 2)];
     viewer.camera.flyTo({
-      destination: center,
+      destination: new Cesium.Cartesian3(-2426151.7109945263,5521642.777142626,2371613.0384705933),
       orientation: {
         heading: Cesium.Math.toRadians(0),
         pitch: Cesium.Math.toRadians(-35),
