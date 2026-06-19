@@ -1,0 +1,956 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/19 14:16:45
+页面标题: Cesium 流动轨迹线
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 流动轨迹线</title>
+<meta name="description" content="一个完整的流动轨迹线示例，包含 Primitive 版本和 Entity 版本两种实现方式。" />
+<template>
+ <div id="cesiumContainer"></div>
+
+ <div class="status-bar" id="statusBar">
+   📊 线条: <span class="highlight" id="lineCount">0</span>
+   <span id="currentPreset"></span>
+ </div>
+
+ <div class="control-panel">
+   <button class="btn-add" id="addBtn">➕ 添加</button>
+   <button class="btn-clear" id="clearBtn">🗑 清除</button>
+
+   <div class="control-group">
+     <label>颜色 <input type="color" id="colorPicker" value="#ffd700"></label>
+   </div>
+   <div class="control-group">
+     <label>速度 <input type="range" id="speedSlider" min="0.1" max="3.0" step="0.1" value="1.0">
+       <span class="value" id="speedValue">1.0</span></label>
+   </div>
+   <div class="control-group">
+     <label>线宽 <input type="range" id="widthSlider" min="2" max="20" step="1" value="6">
+       <span class="value" id="widthValue">6</span></label>
+   </div>
+
+   <button class="btn-shape active-shape" data-shape="parabolic">🚀 抛物线</button>
+   <button class="btn-shape" data-shape="flat">➖ 地平线</button>
+
+   <button class="btn-mode active-mode" data-mode="primitive">🔷 Primitive</button>
+   <button class="btn-mode" data-mode="entity">📦 Entity</button>
+ </div>
+</template>
+<script type="module">
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+window.viewer = viewer
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+viewer.camera.setView({
+  destination: new Cesium.Cartesian3(-1723510.532817322,
+5012033.312388022,
+3563208.0487310733),
+  orientation: {
+    heading: 0,
+    pitch: Cesium.Math.toRadians(-50),
+    roll: 0
+  }
+});
+
+// ================================================================
+//  2. Canvas 生成渐变纹理
+// ================================================================
+function generateSpriteTexture(width, height, colorHex) {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+
+  const c = Cesium.Color.fromCssColorString(colorHex);
+  const r = Math.floor(c.red * 255);
+  const g = Math.floor(c.green * 255);
+  const b = Math.floor(c.blue * 255);
+
+  const gradient = ctx.createLinearGradient(0, 0, width, 0);
+  gradient.addColorStop(0.0, `rgba(${r},${g},${b},0)`);
+  gradient.addColorStop(0.3, `rgba(${r},${g},${b},1)`);
+  gradient.addColorStop(0.7, `rgba(${r},${g},${b},1)`);
+  gradient.addColorStop(1.0, `rgba(${r},${g},${b},0)`);
+
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, width, height);
+  return canvas.toDataURL('image/png');
+}
+
+const DEFAULT_SPRITE_LINE = generateSpriteTexture(256, 4, '#ffffff');
+
+// ================================================================
+//  3. SpriteLineMaterial
+// ================================================================
+
+const SPRITE_LINE_TYPE = 'SpriteLine';
+
+const SPRITE_LINE_SOURCE = `
+            uniform vec4 baseColor;
+            uniform sampler2D image;
+            uniform float animationSpeed;
+
+            czm_material czm_getMaterial(czm_materialInput materialInput) {
+                czm_material material = czm_getDefaultMaterial(materialInput);
+                vec2 st = materialInput.st;
+
+                float time = czm_frameNumber * animationSpeed;
+                float s = fract(st.s - time);
+
+                vec4 colorImage = texture(image, vec2(s, st.t));
+
+                material.alpha = colorImage.a;
+                material.diffuse = mix(colorImage.rgb, baseColor.rgb, 1.0);
+                material.emission = baseColor.rgb * 0.5;
+
+                return material;
+            }
+        `;
+
+function registerSpriteLineMaterial() {
+  try {
+    if (Cesium.Material._materialCache._materials &&
+      Cesium.Material._materialCache._materials[SPRITE_LINE_TYPE]) {
+      return true;
+    }
+  } catch (e) {}
+
+  try {
+    Cesium.Material._materialCache.addMaterial(SPRITE_LINE_TYPE, {
+      fabric: {
+        type: SPRITE_LINE_TYPE,
+        uniforms: {
+          baseColor: new Cesium.Color(1.0, 0.84, 0.0, 1.0),
+          image: DEFAULT_SPRITE_LINE,
+          animationSpeed: 0.01
+        },
+        source: SPRITE_LINE_SOURCE
+      },
+      translucent: function() {
+        return true;
+      }
+    });
+    console.log('✅ SpriteLine 材质注册成功');
+    return true;
+  } catch (e) {
+    console.error('❌ SpriteLine 材质注册失败:', e);
+    return false;
+  }
+}
+
+registerSpriteLineMaterial();
+
+// ================================================================
+//  4. 西安市内地点
+// ================================================================
+
+const XI_AN_POINTS = [{
+    name: '钟楼',
+    lng: 108.940,
+    lat: 34.260
+  },
+  {
+    name: '大雁塔',
+    lng: 108.959,
+    lat: 34.219
+  },
+  {
+    name: '西安北站',
+    lng: 108.934,
+    lat: 34.377
+  },
+  {
+    name: '西安南站',
+    lng: 109.003,
+    lat: 34.131
+  },
+  {
+    name: '西安站',
+    lng: 108.972,
+    lat: 34.284
+  },
+  {
+    name: '高新',
+    lng: 108.891,
+    lat: 34.233
+  },
+  {
+    name: '浐灞',
+    lng: 109.040,
+    lat: 34.321
+  },
+  {
+    name: '长安',
+    lng: 108.946,
+    lat: 34.160
+  },
+  {
+    name: '未央',
+    lng: 108.933,
+    lat: 34.350
+  },
+  {
+    name: '曲江',
+    lng: 108.978,
+    lat: 34.203
+  },
+];
+
+// ================================================================
+//  5. 轨迹生成：抛物线 / 地平线（直线）
+// ================================================================
+
+/**
+ * 生成抛物线轨迹（弧线抬升）
+ */
+function generateParabolicArc(lng1, lat1, lng2, lat2, height, pointCount) {
+  const startPoint = Cesium.Cartesian3.fromDegrees(lng1, lat1, 500);
+  const endPoint = Cesium.Cartesian3.fromDegrees(lng2, lat2, 500);
+
+  const result = [];
+  const startPos = Cesium.Cartographic.fromCartesian(startPoint);
+  const endPos = Cesium.Cartographic.fromCartesian(endPoint);
+
+  const startLon = startPos.longitude * 180 / Math.PI;
+  const startLat = startPos.latitude * 180 / Math.PI;
+  const endLon = endPos.longitude * 180 / Math.PI;
+  const endLat = endPos.latitude * 180 / Math.PI;
+
+  const distance = Math.sqrt(
+    (startLon - endLon) * (startLon - endLon) +
+    (startLat - endLat) * (startLat - endLat)
+  );
+  const curvature = distance * 0.5;
+
+  const startVec = Cesium.Cartesian3.clone(startPoint);
+  const endVec = Cesium.Cartesian3.clone(endPoint);
+
+  const startLength = Cesium.Cartesian3.distance(startVec, Cesium.Cartesian3.ZERO);
+  const endLength = Cesium.Cartesian3.distance(endVec, Cesium.Cartesian3.ZERO);
+
+  Cesium.Cartesian3.normalize(startVec, startVec);
+  Cesium.Cartesian3.normalize(endVec, endVec);
+
+  if (Cesium.Cartesian3.distance(startVec, endVec) === 0) return result;
+
+  const omega = Cesium.Cartesian3.angleBetween(startVec, endVec);
+  result.push(startPoint);
+
+  for (let i = 1; i < pointCount - 1; i++) {
+    const t = i * 1.0 / (pointCount - 1);
+    const invT = 1.0 - t;
+
+    const startScalar = Math.sin(invT * omega) / Math.sin(omega);
+    const endScalar = Math.sin(t * omega) / Math.sin(omega);
+
+    const startScalarVec = Cesium.Cartesian3.multiplyByScalar(
+      startVec, startScalar, new Cesium.Cartesian3()
+    );
+    const endScalarVec = Cesium.Cartesian3.multiplyByScalar(
+      endVec, endScalar, new Cesium.Cartesian3()
+    );
+
+    let centerVec = Cesium.Cartesian3.add(startScalarVec, endScalarVec, new Cesium.Cartesian3());
+
+    const theta = t * Math.PI;
+    const currentLength = startLength * invT + endLength * t + Math.sin(theta) * height;
+
+    centerVec = Cesium.Cartesian3.multiplyByScalar(centerVec, currentLength, centerVec);
+    result.push(centerVec);
+  }
+
+  result.push(endPoint);
+  return result;
+}
+
+/**
+ * 生成地平线轨迹（两点直接连线，高度恒定）
+ */
+function generateFlatArc(lng1, lat1, lng2, lat2, pointCount) {
+  const result = [];
+  const baseHeight = 1000;
+
+  for (let i = 0; i < pointCount; i++) {
+    const t = i / (pointCount - 1);
+    const lng = lng1 + (lng2 - lng1) * t;
+    const lat = lat1 + (lat2 - lat1) * t;
+    // 高度保持不变，形成直线
+    result.push(Cesium.Cartesian3.fromDegrees(lng, lat, baseHeight));
+  }
+
+  return result;
+}
+
+function generateRandomXiAnArc(shapeType) {
+  const idx1 = Math.floor(Math.random() * XI_AN_POINTS.length);
+  let idx2 = Math.floor(Math.random() * XI_AN_POINTS.length);
+  while (idx2 === idx1) {
+    idx2 = Math.floor(Math.random() * XI_AN_POINTS.length);
+  }
+
+  const p1 = XI_AN_POINTS[idx1];
+  const p2 = XI_AN_POINTS[idx2];
+
+  let positions;
+  let height;
+
+  if (shapeType === 'parabolic') {
+    height = 3000 + Math.random() * 5000;
+    const pointCount = 40 + Math.floor(Math.random() * 20);
+    positions = generateParabolicArc(p1.lng, p1.lat, p2.lng, p2.lat, height, pointCount);
+  } else {
+    const pointCount = 30 + Math.floor(Math.random() * 20);
+    positions = generateFlatArc(p1.lng, p1.lat, p2.lng, p2.lat, pointCount);
+  }
+
+  return {
+    positions: positions,
+    startName: p1.name,
+    endName: p2.name,
+    height: height || 0
+  };
+}
+
+// ================================================================
+//  6. 线条管理
+// ================================================================
+
+let lineItems = [];
+let lineCount = 0;
+let currentMode = 'primitive';
+let currentShape = 'parabolic';
+const lineCountEl = document.getElementById('lineCount');
+const currentPresetEl = document.getElementById('currentPreset');
+
+function updateStatus(name) {
+  const shapeLabel = currentShape === 'parabolic' ? '🚀抛物线' : '➖地平线';
+  const modeLabel = currentMode === 'primitive' ? '🔷Primitive' : '📦Entity';
+  lineCountEl.textContent = lineCount;
+  currentPresetEl.innerHTML = name ?
+    ' | ' + name + ' | <span class="shape-label">' + shapeLabel + '</span> | <span class="mode-label">' +
+    modeLabel + '</span>' :
+    '';
+}
+
+function getParams() {
+  const color = document.getElementById('colorPicker').value;
+  const speed = parseFloat(document.getElementById('speedSlider').value);
+  const width = parseInt(document.getElementById('widthSlider').value);
+  return {
+    color,
+    speed,
+    width
+  };
+}
+
+// ================================================================
+//  6.1 创建线条
+// ================================================================
+
+function createFlowLine(positions, params, mode) {
+  const color = Cesium.Color.fromCssColorString(params.color);
+  const texture = generateSpriteTexture(256, 4, params.color);
+
+  if (mode === 'primitive') {
+    const material = new Cesium.Material({
+      fabric: {
+        type: SPRITE_LINE_TYPE,
+        uniforms: {
+          baseColor: color,
+          image: texture,
+          animationSpeed: params.speed * 0.015
+        },
+        source: SPRITE_LINE_SOURCE
+      }
+    });
+
+    const primitive = new Cesium.Primitive({
+      geometryInstances: new Cesium.GeometryInstance({
+        geometry: new Cesium.PolylineGeometry({
+          positions: positions,
+          width: params.width,
+          vertexFormat: Cesium.VertexFormat.ALL
+        })
+      }),
+      appearance: new Cesium.PolylineMaterialAppearance({
+        material: material,
+        translucent: true
+      })
+    });
+
+    viewer.scene.primitives.add(primitive);
+
+    return {
+      primitive: primitive,
+      material: material,
+      type: 'primitive'
+    };
+
+  } else {
+    registerSpriteLineMaterial();
+
+    const materialProperty = {
+      getType: function() {
+        return SPRITE_LINE_TYPE;
+      },
+      getValue: function(time, result) {
+        if (!Cesium.defined(result)) result = {};
+        result.baseColor = color;
+        result.image = texture;
+        result.animationSpeed = params.speed * 0.015;
+        return result;
+      },
+      equals: function(other) {
+        return this === other;
+      },
+      isConstant: false,
+      definitionChanged: new Cesium.Event()
+    };
+
+    const entity = viewer.entities.add({
+      polyline: {
+        positions: positions,
+        width: params.width,
+        material: materialProperty,
+        clampToGround: false,
+        arcType: Cesium.ArcType.NONE
+      }
+    });
+
+    return {
+      entity: entity,
+      materialProperty: materialProperty,
+      type: 'entity'
+    };
+  }
+}
+
+// ================================================================
+//  6.2 添加轨迹
+// ================================================================
+
+function addFlowLine() {
+  const params = getParams();
+  const arcData = generateRandomXiAnArc(currentShape);
+  const positions = arcData.positions;
+
+  const result = createFlowLine(positions, params, currentMode);
+
+  const item = {
+    ...result,
+    positions: positions,
+    params: params,
+    shape: currentShape,
+    mode: currentMode,
+    name: arcData.startName + ' → ' + arcData.endName
+  };
+  lineItems.push(item);
+
+  lineCount++;
+  updateStatus(item.name);
+
+  console.log('📌 添加轨迹: ' + item.name + ' | 模式: ' + currentMode + ' | 形状: ' + currentShape +
+    ' | 点数: ' + positions.length);
+}
+
+// ================================================================
+//  6.3 重建所有线条
+// ================================================================
+
+function rebuildAllLines() {
+  const params = getParams();
+
+  const oldItems = lineItems.slice();
+  lineItems = [];
+
+  oldItems.forEach(item => {
+    if (item.primitive) {
+      viewer.scene.primitives.remove(item.primitive);
+    }
+    if (item.entity) {
+      viewer.entities.remove(item.entity);
+    }
+
+    // 根据当前形状重新生成轨迹
+    let positions;
+    // 从 item.positions 中提取起点和终点
+    const startPos = item.positions[0];
+    const endPos = item.positions[item.positions.length - 1];
+    const startCarto = Cesium.Cartographic.fromCartesian(startPos);
+    const endCarto = Cesium.Cartographic.fromCartesian(endPos);
+
+    const lng1 = Cesium.Math.toDegrees(startCarto.longitude);
+    const lat1 = Cesium.Math.toDegrees(startCarto.latitude);
+    const lng2 = Cesium.Math.toDegrees(endCarto.longitude);
+    const lat2 = Cesium.Math.toDegrees(endCarto.latitude);
+
+    if (currentShape === 'parabolic') {
+      const height = 3000 + Math.random() * 5000;
+      const pointCount = 40 + Math.floor(Math.random() * 20);
+      positions = generateParabolicArc(lng1, lat1, lng2, lat2, height, pointCount);
+    } else {
+      const pointCount = 30 + Math.floor(Math.random() * 20);
+      positions = generateFlatArc(lng1, lat1, lng2, lat2, pointCount);
+    }
+
+    const result = createFlowLine(positions, params, currentMode);
+
+    const newItem = {
+      ...result,
+      positions: positions,
+      params: params,
+      shape: currentShape,
+      mode: currentMode,
+      name: item.name
+    };
+    lineItems.push(newItem);
+  });
+
+  updateStatus(lineItems.length > 0 ? lineItems[0].name : '');
+  console.log('🔄 已重建所有线条 | 模式: ' + currentMode + ' | 形状: ' + currentShape + ' | 线宽: ' + params.width);
+}
+
+// ================================================================
+//  7. UI 事件绑定
+// ================================================================
+
+document.getElementById('addBtn').addEventListener('click', function() {
+  addFlowLine();
+});
+
+document.getElementById('clearBtn').addEventListener('click', function() {
+  lineItems.forEach(item => {
+    if (item.primitive) viewer.scene.primitives.remove(item.primitive);
+    if (item.entity) viewer.entities.remove(item.entity);
+  });
+  lineItems = [];
+  lineCount = 0;
+  updateStatus();
+  console.log('🗑 已清除所有线条');
+});
+
+// ---- 形状切换 ----
+document.querySelectorAll('.btn-shape').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.btn-shape').forEach(b => b.classList.remove('active-shape'));
+    this.classList.add('active-shape');
+    currentShape = this.dataset.shape;
+    if (lineItems.length > 0) {
+      rebuildAllLines();
+    }
+    console.log('📌 切换形状: ' + currentShape);
+  });
+});
+
+// ---- 模式切换 ----
+document.querySelectorAll('.btn-mode').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.btn-mode').forEach(b => b.classList.remove('active-mode'));
+    this.classList.add('active-mode');
+    currentMode = this.dataset.mode;
+    if (lineItems.length > 0) {
+      rebuildAllLines();
+    }
+    console.log('📌 切换模式: ' + currentMode);
+  });
+});
+
+// ---- 速度滑块 ----
+document.getElementById('speedSlider').addEventListener('input', function() {
+  const val = parseFloat(this.value);
+  document.getElementById('speedValue').textContent = val.toFixed(1);
+  lineItems.forEach(item => {
+    if (item.material && item.material.uniforms) {
+      item.material.uniforms.animationSpeed = val * 0.015;
+    }
+    if (item.materialProperty) {
+      item.materialProperty.animationSpeed = val * 0.015;
+      if (item.materialProperty.definitionChanged) {
+        item.materialProperty.definitionChanged.raiseEvent();
+      }
+    }
+  });
+});
+
+// ---- 宽度滑块 ----
+document.getElementById('widthSlider').addEventListener('input', function() {
+  const val = parseInt(this.value);
+  document.getElementById('widthValue').textContent = val;
+  if (lineItems.length > 0) {
+    rebuildAllLines();
+  }
+});
+
+// ---- 颜色选择器 ----
+document.getElementById('colorPicker').addEventListener('input', function() {
+  if (lineItems.length > 0) {
+    rebuildAllLines();
+  }
+});
+
+// ================================================================
+//  8. 初始化示例
+// ================================================================
+
+registerSpriteLineMaterial();
+
+setTimeout(() => {
+  const configs = [{
+      color: '#ffd700',
+      shape: 'parabolic',
+      mode: 'primitive'
+    },
+    {
+      color: '#00ff88',
+      shape: 'flat',
+      mode: 'primitive'
+    },
+    {
+      color: '#ff6633',
+      shape: 'parabolic',
+      mode: 'entity'
+    },
+    {
+      color: '#66d9ff',
+      shape: 'flat',
+      mode: 'entity'
+    },
+  ];
+
+  configs.forEach((cfg, index) => {
+    setTimeout(() => {
+      document.getElementById('colorPicker').value = cfg.color;
+      currentShape = cfg.shape;
+      currentMode = cfg.mode;
+      document.querySelectorAll('.btn-shape').forEach(b => {
+        b.classList.toggle('active-shape', b.dataset.shape === cfg.shape);
+      });
+      document.querySelectorAll('.btn-mode').forEach(b => {
+        b.classList.toggle('active-mode', b.dataset.mode === cfg.mode);
+      });
+      addFlowLine();
+    }, index * 500);
+  });
+
+  setTimeout(() => {
+    document.getElementById('colorPicker').value = '#ffd700';
+    currentShape = 'parabolic';
+    currentMode = 'primitive';
+    document.querySelectorAll('.btn-shape').forEach(b => {
+      b.classList.toggle('active-shape', b.dataset.shape === 'parabolic');
+    });
+    document.querySelectorAll('.btn-mode').forEach(b => {
+      b.classList.toggle('active-mode', b.dataset.mode === 'primitive');
+    });
+  }, configs.length * 500 + 300);
+}, 500);
+
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+console.log('✅ 西安流动轨迹线已加载');
+console.log('📌 形状差异:');
+console.log('  - 🚀 抛物线: 弧线抬升，中间高两端低');
+console.log('  - ➖ 地平线: 两点直接连线，高度恒定');
+console.log('📌 模式差异: Primitive 和 Entity 视觉一致，底层实现不同');
+</script>
+<style>
+ * {
+   margin: 0;
+   padding: 0;
+   box-sizing: border-box;
+ }
+
+ html,
+ body {
+   width: 100%;
+   height: 100%;
+   overflow: hidden;
+   font-family: 'Microsoft YaHei', sans-serif;
+ }
+
+ #cesiumContainer {
+   width: 100%;
+   height: 100%;
+   position: relative;
+ }
+
+ .control-panel {
+   position: absolute;
+   bottom: 30px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.85);
+   backdrop-filter: blur(12px);
+   padding: 16px 24px;
+   border-radius: 16px;
+   border: 1px solid rgba(255, 255, 255, 0.08);
+   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+   display: flex;
+   align-items: center;
+   gap: 10px;
+   flex-wrap: wrap;
+   justify-content: center;
+   max-width: 98%;
+ }
+
+ .control-panel button {
+   padding: 6px 14px;
+   border: none;
+   border-radius: 8px;
+   font-size: 12px;
+   font-weight: 600;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+   white-space: nowrap;
+ }
+
+ .control-panel button:active {
+   transform: scale(0.95);
+ }
+
+ .btn-add {
+   background: #00aaff;
+   color: #fff;
+ }
+
+ .btn-add:hover {
+   background: #0099ee;
+   box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+ }
+
+ .btn-clear {
+   background: rgba(255, 255, 255, 0.08);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+ }
+
+ .btn-clear:hover {
+   background: rgba(255, 60, 60, 0.2);
+   color: #ff6b6b;
+   border-color: #ff6b6b;
+ }
+
+ .control-group {
+   display: flex;
+   align-items: center;
+   gap: 6px;
+   color: #aaa;
+   font-size: 11px;
+   flex-wrap: wrap;
+ }
+
+ .control-group label {
+   display: flex;
+   align-items: center;
+   gap: 3px;
+   white-space: nowrap;
+ }
+
+ .control-group input[type="color"] {
+   width: 24px;
+   height: 24px;
+   border: 2px solid rgba(255, 255, 255, 0.2);
+   border-radius: 6px;
+   cursor: pointer;
+   background: none;
+   padding: 0;
+ }
+
+ .control-group input[type="color"]::-webkit-color-swatch-wrapper {
+   padding: 2px;
+ }
+
+ .control-group input[type="color"]::-webkit-color-swatch {
+   border: none;
+   border-radius: 4px;
+ }
+
+ .control-group input[type="range"] {
+   width: 60px;
+   height: 4px;
+   -webkit-appearance: none;
+   background: rgba(255, 255, 255, 0.2);
+   border-radius: 2px;
+   outline: none;
+ }
+
+ .control-group input[type="range"]::-webkit-slider-thumb {
+   -webkit-appearance: none;
+   width: 12px;
+   height: 12px;
+   border-radius: 50%;
+   background: #00aaff;
+   cursor: pointer;
+ }
+
+ .control-group .value {
+   color: #00aaff;
+   font-weight: 600;
+   min-width: 28px;
+   text-align: center;
+ }
+
+ .btn-shape {
+   background: rgba(255, 255, 255, 0.08);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+   font-size: 11px;
+   padding: 5px 12px;
+   border-radius: 8px;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+ }
+
+ .btn-shape:hover {
+   background: rgba(255, 255, 255, 0.18);
+   color: #fff;
+ }
+
+ .btn-shape.active-shape {
+   border-color: #ff8844;
+   color: #ff8844;
+   background: rgba(255, 136, 68, 0.15);
+ }
+
+ .btn-mode {
+   background: rgba(255, 255, 255, 0.08);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+   font-size: 11px;
+   padding: 5px 12px;
+   border-radius: 8px;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+ }
+
+ .btn-mode:hover {
+   background: rgba(255, 255, 255, 0.18);
+   color: #fff;
+ }
+
+ .btn-mode.active-mode {
+   border-color: #00aaff;
+   color: #00aaff;
+   background: rgba(0, 170, 255, 0.15);
+ }
+
+ .status-bar {
+   position: absolute;
+   top: 20px;
+   right: 20px;
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.7);
+   backdrop-filter: blur(8px);
+   padding: 10px 16px;
+   border-radius: 10px;
+   color: #aaa;
+   font-size: 12px;
+   border: 1px solid rgba(255, 255, 255, 0.05);
+   font-family: monospace;
+   pointer-events: none;
+   max-width: 350px;
+ }
+
+ .status-bar .highlight {
+   color: #00aaff;
+   font-weight: 600;
+ }
+
+ .status-bar .mode-label {
+   color: #ff8844;
+ }
+
+ .status-bar .shape-label {
+   color: #66d9ff;
+ }
+
+ .cesium-viewer-cesiumCreditContainer {
+   display: none !important;
+ }
+
+ @media (max-width: 768px) {
+   .control-panel {
+     bottom: 12px;
+     padding: 8px 10px;
+     gap: 6px;
+     width: 98%;
+     border-radius: 12px;
+   }
+
+   .control-panel button {
+     font-size: 10px;
+     padding: 4px 10px;
+   }
+
+   .control-group input[type="range"] {
+     width: 40px;
+   }
+
+   .control-group {
+     font-size: 10px;
+   }
+
+   .status-bar {
+     top: 12px;
+     right: 12px;
+     padding: 6px 10px;
+     font-size: 10px;
+     max-width: 200px;
+   }
+ }
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
