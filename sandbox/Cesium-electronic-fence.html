@@ -1,0 +1,880 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/20 14:56:34
+页面标题: Cesium 自定义材质 Wall Entity
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 自定义材质 Wall Entity</title>
+<meta name="description" content="一个完整的自定义材质 Wall Entity 示例，包含纹理滚动动画、方向控制、颜色叠加和实时参数调节功能。" />
+<template>
+ <div id="cesiumContainer"></div>
+
+ <div class="status-bar" id="statusBar">
+   📊 围栏: <span class="highlight" id="wallCount">0</span>
+   <span id="currentPreset"></span>
+ </div>
+
+ <div class="control-panel">
+   <button class="btn-add" id="addBtn">➕ 添加围栏</button>
+   <button class="btn-clear" id="clearBtn">🗑 清除</button>
+
+   <div class="control-group">
+     <label>颜色 <input type="color" id="colorPicker" value="#00ff88"></label>
+   </div>
+   <div class="control-group">
+     <label>速度 <input type="range" id="speedSlider" min="0.1" max="3.0" step="0.1" value="1.0">
+       <span class="value" id="speedValue">1.0</span></label>
+   </div>
+   <div class="control-group">
+     <label>高度 <input type="range" id="heightSlider" min="5" max="50" step="1" value="20">
+       <span class="value" id="heightValue">20</span></label>
+   </div>
+
+   <button class="btn-dir active-dir" data-dir="up">⬆️ 上升</button>
+   <button class="btn-dir" data-dir="down">⬇️ 下降</button>
+ </div>
+</template>
+<script type="module">
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+viewer.camera.setView({
+  destination: Cesium.Cartesian3.fromDegrees(116.3974, 39.9093, 120),
+  orientation: {
+    heading: 0,
+    pitch: Cesium.Math.toRadians(-45),
+    roll: 0
+  }
+});
+
+// ================================================================
+//  2. Canvas 生成均匀发光条纹纹理
+// ================================================================
+function generateFenceTexture(width, height, colorHex) {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+
+  const c = Cesium.Color.fromCssColorString(colorHex);
+  const r = Math.floor(c.red * 255);
+  const g = Math.floor(c.green * 255);
+  const b = Math.floor(c.blue * 255);
+
+  ctx.clearRect(0, 0, width, height);
+
+  // 均匀分布的光带
+  const numBands = 12;
+
+  for (let i = 0; i < numBands; i++) {
+    const y = (i / numBands) * height;
+    const nextY = ((i + 1) / numBands) * height;
+
+    for (let py = Math.floor(y); py < Math.floor(nextY); py++) {
+      const t = (py - y) / (nextY - y);
+      const intensity = Math.exp(-Math.pow((t - 0.5) * 6, 2));
+      const alpha = intensity * 0.85;
+      const finalAlpha = Math.min(alpha, 0.95);
+
+      ctx.fillStyle = `rgba(${r},${g},${b},${finalAlpha})`;
+      ctx.fillRect(0, py, width, 1);
+    }
+  }
+
+  // 横向高光线
+  for (let i = 0; i < 20; i++) {
+    const y = (i / 20) * height;
+    const alpha = 0.08 + Math.sin(i * 1.5) * 0.04 + 0.04;
+    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    ctx.fillRect(0, y, width, 1.5);
+  }
+
+  return canvas.toDataURL('image/png');
+}
+
+// ================================================================
+//  3. 自定义材质 - 电子围栏（流动方向控制）
+// ================================================================
+
+let materialTypeCounter = 0;
+let currentDirection = 'up';
+
+function createFenceMaterial(options) {
+  const MaterialType = 'FenceType_' + (++materialTypeCounter);
+  const direction = options.direction || 'up';
+
+  // 【修复】上升：st.t + offset（从底部向上）
+  //         下降：st.t - offset（从顶部向下）
+  const dirSign = direction === 'up' ? -1 : 1;
+
+  const shaderSource = `
+                uniform vec4 color;
+                uniform sampler2D image;
+                uniform float time;
+                uniform float speed;
+                uniform float fenceHeight;
+
+                czm_material czm_getMaterial(czm_materialInput materialInput) {
+                    czm_material material = czm_getDefaultMaterial(materialInput);
+                    vec2 st = materialInput.st;
+
+                    // 流动方向：上升(+1) / 下降(-1)
+                    float offset = time * speed * ${dirSign.toFixed(1)};
+                    float t = fract(st.t + offset);
+
+                    vec4 colorImage = texture(image, vec2(st.s, t));
+
+                    vec3 diffuse = color.rgb * colorImage.rgb;
+                    float alpha = colorImage.a * color.a;
+                    vec3 emission = diffuse * 0.5;
+
+                    material.diffuse = diffuse;
+                    material.alpha = alpha;
+                    material.emission = emission;
+
+                    return material;
+                }
+            `;
+
+  function FenceMaterialProperty(options) {
+    options = options || {};
+    this._definitionChanged = new Cesium.Event();
+    this._color = undefined;
+    this._colorSubscription = undefined;
+    this.color = options.color || Cesium.Color.GREEN;
+    this.speed = options.speed || 1.0;
+    this.image = options.image || null;
+    this.fenceHeight = options.fenceHeight || 20;
+    this.direction = options.direction || 'up';
+    this._time = new Date().getTime();
+  }
+
+  Object.defineProperties(FenceMaterialProperty.prototype, {
+    isConstant: {
+      get: function() {
+        return false;
+      }
+    },
+    definitionChanged: {
+      get: function() {
+        return this._definitionChanged;
+      }
+    },
+    color: Cesium.createPropertyDescriptor('color'),
+    speed: Cesium.createPropertyDescriptor('speed'),
+    image: Cesium.createPropertyDescriptor('image'),
+    fenceHeight: Cesium.createPropertyDescriptor('fenceHeight'),
+    direction: Cesium.createPropertyDescriptor('direction')
+  });
+
+  FenceMaterialProperty.prototype.getType = function(time) {
+    return MaterialType;
+  };
+
+  FenceMaterialProperty.prototype.getValue = function(time, result) {
+    if (!Cesium.defined(result)) {
+      result = {};
+    }
+
+    result.color = Cesium.Property.getValueOrClonedDefault(
+      this._color,
+      time,
+      Cesium.Color.GREEN,
+      result.color
+    );
+    result.image = this._image;
+    result.speed = this._speed || 1.0;
+    result.fenceHeight = this._fenceHeight || 20;
+
+    const elapsed = (new Date().getTime() - this._time) % 2000;
+    result.time = elapsed / 2000;
+
+    return result;
+  };
+
+  FenceMaterialProperty.prototype.equals = function(other) {
+    return this === other ||
+      (other instanceof FenceMaterialProperty &&
+        Cesium.Property.equals(this._color, other._color) &&
+        this._image === other._image &&
+        this._speed === other._speed);
+  };
+
+  Cesium.Material._materialCache.addMaterial(MaterialType, {
+    fabric: {
+      type: MaterialType,
+      uniforms: {
+        color: options.color || new Cesium.Color(0.0, 1.0, 0.0, 0.8),
+        image: options.image || null,
+        time: 0,
+        speed: options.speed || 1.0,
+        fenceHeight: options.fenceHeight || 20
+      },
+      source: shaderSource
+    },
+    translucent: function(material) {
+      return true;
+    }
+  });
+
+  return new FenceMaterialProperty(options);
+}
+
+// ================================================================
+//  4. 围栏管理
+// ================================================================
+
+let wallItems = [];
+let wallCount = 0;
+const wallCountEl = document.getElementById('wallCount');
+const currentPresetEl = document.getElementById('currentPreset');
+
+function updateStatus(name) {
+  const dirLabel = currentDirection === 'up' ? '⬆️上升' : '⬇️下降';
+  wallCountEl.textContent = wallCount;
+  currentPresetEl.innerHTML = name ? ' | ' + name + ' | ' + dirLabel : '';
+}
+
+function getParams() {
+  const color = document.getElementById('colorPicker').value;
+  const speed = parseFloat(document.getElementById('speedSlider').value);
+  const height = parseInt(document.getElementById('heightSlider').value);
+  return {
+    color,
+    speed,
+    height
+  };
+}
+
+// ================================================================
+//  4.1 添加电子围栏
+// ================================================================
+
+function addFence() {
+  const params = getParams();
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  const centerLng = 116.3974;
+  const centerLat = 39.9093;
+
+  const widthMeters = 60 + Math.random() * 40;
+  const depthMeters = 40 + Math.random() * 40;
+
+  const halfWidth = widthMeters / 2 / 111000;
+  const halfDepth = depthMeters / 2 / 111000;
+
+  const lng1 = centerLng - halfWidth;
+  const lng2 = centerLng + halfWidth;
+  const lat1 = centerLat - halfDepth;
+  const lat2 = centerLat + halfDepth;
+
+  const height = params.height;
+
+  const texture = generateFenceTexture(128, 256, params.color);
+
+  const materialProperty = createFenceMaterial({
+    color: color,
+    speed: params.speed * 0.5,
+    image: texture,
+    fenceHeight: height,
+    direction: currentDirection
+  });
+
+  const p1 = Cesium.Cartesian3.fromDegrees(lng1, lat1, 0);
+  const p2 = Cesium.Cartesian3.fromDegrees(lng2, lat1, 0);
+  const p3 = Cesium.Cartesian3.fromDegrees(lng2, lat2, 0);
+  const p4 = Cesium.Cartesian3.fromDegrees(lng1, lat2, 0);
+
+  const p1t = Cesium.Cartesian3.fromDegrees(lng1, lat1, height);
+  const p2t = Cesium.Cartesian3.fromDegrees(lng2, lat1, height);
+  const p3t = Cesium.Cartesian3.fromDegrees(lng2, lat2, height);
+  const p4t = Cesium.Cartesian3.fromDegrees(lng1, lat2, height);
+
+  const wallData = [{
+      positions: [p1, p2, p2t, p1t]
+    },
+    {
+      positions: [p2, p3, p3t, p2t]
+    },
+    {
+      positions: [p3, p4, p4t, p3t]
+    },
+    {
+      positions: [p4, p1, p1t, p4t]
+    },
+  ];
+
+  const entities = [];
+
+  wallData.forEach((wall) => {
+    const entity = viewer.entities.add({
+      wall: {
+        positions: wall.positions,
+        material: materialProperty,
+        minimumHeights: [0, 0, 0, 0],
+        maximumHeights: [height, height, height, height]
+      }
+    });
+    entities.push(entity);
+  });
+
+  // 顶部边框
+  const topPositions = [p1t, p2t, p3t, p4t, p1t];
+  const topEntity = viewer.entities.add({
+    polyline: {
+      positions: topPositions,
+      width: 2.5,
+      material: new Cesium.PolylineGlowMaterialProperty({
+        glowPower: 0.9,
+        color: color
+      }),
+      clampToGround: false
+    }
+  });
+
+  // 底部边框
+  const bottomPositions = [p1, p2, p3, p4, p1];
+  const bottomEntity = viewer.entities.add({
+    polyline: {
+      positions: bottomPositions,
+      width: 1.5,
+      material: new Cesium.PolylineGlowMaterialProperty({
+        glowPower: 0.4,
+        color: color.withAlpha(0.5)
+      }),
+      clampToGround: false
+    }
+  });
+
+  const item = {
+    entities: entities,
+    topEntity: topEntity,
+    bottomEntity: bottomEntity,
+    materialProperty: materialProperty,
+    width: widthMeters,
+    depth: depthMeters,
+    height: height,
+    params: params
+  };
+  wallItems.push(item);
+
+  wallCount++;
+  updateStatus('围栏 #' + wallCount + ' (' + widthMeters.toFixed(0) + '×' + depthMeters.toFixed(0) + 'm)');
+
+  if (wallCount === 1) {
+    const center = Cesium.Cartesian3.fromDegrees(centerLng, centerLat, height / 2);
+    viewer.camera.flyTo({
+      destination: center,
+      orientation: {
+        heading: 0,
+        pitch: Cesium.Math.toRadians(-50),
+        roll: 0
+      },
+      duration: 1.5,
+      distance: 80
+    });
+  }
+
+  console.log('📌 添加围栏 #' + wallCount + ' | 方向: ' + currentDirection);
+}
+
+// ================================================================
+//  4.2 清除所有围栏
+// ================================================================
+
+function clearAllWalls() {
+  wallItems.forEach(item => {
+    item.entities.forEach(entity => {
+      viewer.entities.remove(entity);
+    });
+    if (item.topEntity) viewer.entities.remove(item.topEntity);
+    if (item.bottomEntity) viewer.entities.remove(item.bottomEntity);
+  });
+  wallItems = [];
+  wallCount = 0;
+  updateStatus();
+  console.log('🗑 已清除所有围栏');
+}
+
+// ================================================================
+//  4.3 重建所有围栏
+// ================================================================
+
+function rebuildAllWalls() {
+  const params = getParams();
+  const color = Cesium.Color.fromCssColorString(params.color);
+  const height = params.height;
+
+  const oldItems = wallItems.slice();
+  wallItems = [];
+
+  oldItems.forEach((item) => {
+    item.entities.forEach(entity => {
+      viewer.entities.remove(entity);
+    });
+    if (item.topEntity) viewer.entities.remove(item.topEntity);
+    if (item.bottomEntity) viewer.entities.remove(item.bottomEntity);
+
+    // 提取位置
+    const firstEntity = item.entities[0];
+    const positions = firstEntity.wall.positions._value;
+    const p1 = positions[0];
+    const p3 = positions[2];
+
+    const carto1 = Cesium.Cartographic.fromCartesian(p1);
+    const carto3 = Cesium.Cartographic.fromCartesian(p3);
+
+    const lng1 = Cesium.Math.toDegrees(carto1.longitude);
+    const lat1 = Cesium.Math.toDegrees(carto1.latitude);
+    const lng2 = Cesium.Math.toDegrees(carto3.longitude);
+    const lat2 = Cesium.Math.toDegrees(carto3.latitude);
+
+    const centerLng = (lng1 + lng2) / 2;
+    const centerLat = (lat1 + lat2) / 2;
+    const halfWidth = Math.abs(lng2 - lng1) / 2;
+    const halfDepth = Math.abs(lat2 - lat1) / 2;
+
+    const nlng1 = centerLng - halfWidth;
+    const nlng2 = centerLng + halfWidth;
+    const nlat1 = centerLat - halfDepth;
+    const nlat2 = centerLat + halfDepth;
+
+    const np1 = Cesium.Cartesian3.fromDegrees(nlng1, nlat1, 0);
+    const np2 = Cesium.Cartesian3.fromDegrees(nlng2, nlat1, 0);
+    const np3 = Cesium.Cartesian3.fromDegrees(nlng2, nlat2, 0);
+    const np4 = Cesium.Cartesian3.fromDegrees(nlng1, nlat2, 0);
+
+    const np1t = Cesium.Cartesian3.fromDegrees(nlng1, nlat1, height);
+    const np2t = Cesium.Cartesian3.fromDegrees(nlng2, nlat1, height);
+    const np3t = Cesium.Cartesian3.fromDegrees(nlng2, nlat2, height);
+    const np4t = Cesium.Cartesian3.fromDegrees(nlng1, nlat2, height);
+
+    const wallData = [{
+        positions: [np1, np2, np2t, np1t]
+      },
+      {
+        positions: [np2, np3, np3t, np2t]
+      },
+      {
+        positions: [np3, np4, np4t, np3t]
+      },
+      {
+        positions: [np4, np1, np1t, np4t]
+      },
+    ];
+
+    const texture = generateFenceTexture(128, 256, params.color);
+
+    const materialProperty = createFenceMaterial({
+      color: color,
+      speed: params.speed * 0.5,
+      image: texture,
+      fenceHeight: height,
+      direction: currentDirection
+    });
+
+    const entities = [];
+    wallData.forEach((wall) => {
+      const entity = viewer.entities.add({
+        wall: {
+          positions: wall.positions,
+          material: materialProperty,
+          minimumHeights: [0, 0, 0, 0],
+          maximumHeights: [height, height, height, height]
+        }
+      });
+      entities.push(entity);
+    });
+
+    const topPositions = [np1t, np2t, np3t, np4t, np1t];
+    const topEntity = viewer.entities.add({
+      polyline: {
+        positions: topPositions,
+        width: 2.5,
+        material: new Cesium.PolylineGlowMaterialProperty({
+          glowPower: 0.9,
+          color: color
+        }),
+        clampToGround: false
+      }
+    });
+
+    const bottomPositions = [np1, np2, np3, np4, np1];
+    const bottomEntity = viewer.entities.add({
+      polyline: {
+        positions: bottomPositions,
+        width: 1.5,
+        material: new Cesium.PolylineGlowMaterialProperty({
+          glowPower: 0.4,
+          color: color.withAlpha(0.5)
+        }),
+        clampToGround: false
+      }
+    });
+
+    const newItem = {
+      entities: entities,
+      topEntity: topEntity,
+      bottomEntity: bottomEntity,
+      materialProperty: materialProperty,
+      width: item.width,
+      depth: item.depth,
+      height: height,
+      params: params
+    };
+    wallItems.push(newItem);
+  });
+
+  updateStatus('已更新');
+  console.log('🔄 已重建所有围栏 | 高度: ' + height + 'm | 方向: ' + currentDirection);
+}
+
+// ================================================================
+//  5. UI 事件绑定
+// ================================================================
+
+document.getElementById('addBtn').addEventListener('click', function() {
+  addFence();
+});
+
+document.getElementById('clearBtn').addEventListener('click', function() {
+  clearAllWalls();
+});
+
+// ---- 流动方向切换 ----
+document.querySelectorAll('.btn-dir').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.btn-dir').forEach(b => b.classList.remove('active-dir'));
+    this.classList.add('active-dir');
+    currentDirection = this.dataset.dir;
+    if (wallItems.length > 0) {
+      rebuildAllWalls();
+    }
+    console.log('📌 切换方向: ' + currentDirection);
+  });
+});
+
+// ---- 速度滑块 ----
+document.getElementById('speedSlider').addEventListener('input', function() {
+  const val = parseFloat(this.value);
+  document.getElementById('speedValue').textContent = val.toFixed(1);
+  wallItems.forEach(item => {
+    if (item.materialProperty) {
+      item.materialProperty.speed = val * 0.5;
+      if (item.materialProperty._definitionChanged) {
+        item.materialProperty._definitionChanged.raiseEvent();
+      }
+    }
+  });
+});
+
+// ---- 高度滑块 ----
+document.getElementById('heightSlider').addEventListener('input', function() {
+  const val = parseInt(this.value);
+  document.getElementById('heightValue').textContent = val;
+  if (wallItems.length > 0) {
+    rebuildAllWalls();
+  }
+});
+
+// ---- 颜色选择器 ----
+document.getElementById('colorPicker').addEventListener('input', function() {
+  if (wallItems.length > 0) {
+    rebuildAllWalls();
+  }
+});
+
+// ================================================================
+//  6. 初始化示例
+// ================================================================
+
+setTimeout(() => {
+  addFence();
+  setTimeout(() => {
+    document.getElementById('colorPicker').value = '#ff6633';
+    document.getElementById('heightSlider').value = '15';
+    document.getElementById('heightValue').textContent = '15';
+    addFence();
+    document.getElementById('colorPicker').value = '#00ff88';
+    document.getElementById('heightSlider').value = '20';
+    document.getElementById('heightValue').textContent = '20';
+  }, 600);
+}, 500);
+
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+console.log('✅ 电子围栏已加载（方向修复版）');
+console.log('📌 方向说明:');
+console.log('  - ⬆️ 上升: 纹理从底部向上流动');
+console.log('  - ⬇️ 下降: 纹理从顶部向下流动');
+console.log('📌 参数: 颜色、速度、高度、方向');
+</script>
+<style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: 'Microsoft YaHei', sans-serif;
+  }
+
+  #cesiumContainer {
+    width: 100%;
+    height: 100%;
+    position: relative;
+  }
+
+  .control-panel {
+    position: absolute;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 100;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(12px);
+    padding: 16px 24px;
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 98%;
+  }
+
+  .control-panel button {
+    padding: 6px 14px;
+    border: none;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+
+  .control-panel button:active {
+    transform: scale(0.95);
+  }
+
+  .btn-add {
+    background: #00aaff;
+    color: #fff;
+  }
+
+  .btn-add:hover {
+    background: #0099ee;
+    box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+  }
+
+  .btn-clear {
+    background: rgba(255, 255, 255, 0.08);
+    color: #ccc;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .btn-clear:hover {
+    background: rgba(255, 60, 60, 0.2);
+    color: #ff6b6b;
+    border-color: #ff6b6b;
+  }
+
+  .control-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #aaa;
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+
+  .control-group label {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    white-space: nowrap;
+  }
+
+  .control-group input[type="color"] {
+    width: 24px;
+    height: 24px;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-radius: 6px;
+    cursor: pointer;
+    background: none;
+    padding: 0;
+  }
+
+  .control-group input[type="color"]::-webkit-color-swatch-wrapper {
+    padding: 2px;
+  }
+
+  .control-group input[type="color"]::-webkit-color-swatch {
+    border: none;
+    border-radius: 4px;
+  }
+
+  .control-group input[type="range"] {
+    width: 50px;
+    height: 4px;
+    -webkit-appearance: none;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+    outline: none;
+  }
+
+  .control-group input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #00aaff;
+    cursor: pointer;
+  }
+
+  .control-group .value {
+    color: #00aaff;
+    font-weight: 600;
+    min-width: 24px;
+    text-align: center;
+  }
+
+  .btn-dir {
+    background: rgba(255, 255, 255, 0.08);
+    color: #ccc;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 11px;
+    padding: 5px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    font-family: inherit;
+  }
+
+  .btn-dir:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+  }
+
+  .btn-dir.active-dir {
+    border-color: #ff8844;
+    color: #ff8844;
+    background: rgba(255, 136, 68, 0.15);
+  }
+
+  .status-bar {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    z-index: 100;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(8px);
+    padding: 10px 16px;
+    border-radius: 10px;
+    color: #aaa;
+    font-size: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    font-family: monospace;
+    pointer-events: none;
+    max-width: 350px;
+  }
+
+  .status-bar .highlight {
+    color: #00aaff;
+    font-weight: 600;
+  }
+
+  .cesium-viewer-cesiumCreditContainer {
+    display: none !important;
+  }
+
+  @media (max-width: 768px) {
+    .control-panel {
+      bottom: 12px;
+      padding: 8px 10px;
+      gap: 6px;
+      width: 98%;
+      border-radius: 12px;
+    }
+
+    .control-panel button {
+      font-size: 10px;
+      padding: 4px 10px;
+    }
+
+    .control-group input[type="range"] {
+      width: 35px;
+    }
+
+    .control-group {
+      font-size: 10px;
+    }
+
+    .status-bar {
+      top: 12px;
+      right: 12px;
+      padding: 6px 10px;
+      font-size: 10px;
+      max-width: 200px;
+    }
+  }
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
