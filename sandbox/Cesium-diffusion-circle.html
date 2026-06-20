@@ -1,0 +1,661 @@
+<!--
+CodeSandbox 分享文件
+生成时间: 2026/6/20 15:50:41
+页面标题: Cesium 自定义扩散圆
+原始页面链接: https://sogrey.top/CodeSandbox/
+-->
+
+<!-- CodeSandbox Template File -->
+<!-- 该文件包含完整的模板数据和设置信息，可以被重新导入 -->
+<engine-type>cesium</engine-type>
+<title>Cesium 自定义扩散圆</title>
+<meta name="description" content="一个完整的扩散圆效果示例，基于 PostProcessStage 后处理，支持颜色、半径、速度、边缘柔和度调节。" />
+<template>
+<div id="cesiumContainer"></div>
+
+<div class="status-bar" id="statusBar">
+  📊 扩散圆: <span class="highlight" id="circleCount">0</span>
+  <span id="currentPreset"></span>
+</div>
+
+<div class="control-panel">
+  <button class="btn-add" id="addBtn">➕ 添加扩散圆</button>
+  <button class="btn-clear" id="clearBtn">🗑 清除</button>
+
+  <div class="control-group">
+    <label>颜色 <input type="color" id="colorPicker" value="#ff4444"></label>
+  </div>
+  <div class="control-group">
+    <label>速度 <input type="range" id="speedSlider" min="0.1" max="3.0" step="0.1" value="1.0">
+      <span class="value" id="speedValue">1.0</span></label>
+  </div>
+  <div class="control-group">
+    <label>半径 <input type="range" id="radiusSlider" min="50" max="2000" step="50" value="500">
+      <span class="value" id="radiusValue">500</span></label>
+  </div>
+  <div class="control-group">
+    <label>边缘柔和 <input type="range" id="borderSlider" min="1" max="20" step="0.5" value="4">
+      <span class="value" id="borderValue">4.0</span></label>
+  </div>
+  <div class="control-group">
+    <label>高度 <input type="range" id="heightSlider" min="0" max="100" step="2" value="10">
+      <span class="value" id="heightValue">10</span></label>
+  </div>
+</div>
+</template>
+<script type="module">
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3OGEyMjQyNy04OGMyLTQyNTYtYTBiMS03YWU1YTk3NDU1NTYiLCJpZCI6MTIwMDIsImlhdCI6MTYwMzc2MzAzNX0.8QDXP7Ds18f95--kaezp4dTxpaOAn1gfJW3OxyO07oc'
+
+// ================================================================
+//  1. 初始化主地图
+// ================================================================
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  geocoder: true,
+  homeButton: true,
+  sceneModePicker: true,
+  navigationHelpButton: true,
+  animation: true,
+  timeline: true,
+  fullscreenButton: true,
+  infoBox: true,
+  selectionIndicator: true,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider()
+});
+window.viewer = viewer
+
+if (viewer.cesiumWidget.creditContainer) {
+  viewer.cesiumWidget.creditContainer.style.display = 'none';
+}
+
+// 加载真实地形
+if (typeof Cesium.createWorldTerrainAsync === 'function') {
+  Cesium.createWorldTerrainAsync({
+    requestWaterMask: true,
+    requestVertexNormals: true
+  }).then(function(provider) {
+    viewer.terrainProvider = provider;
+    console.log('✅ 真实地形加载成功');
+  }).catch(function(e) {
+    console.warn('地形加载失败', e);
+  });
+}
+
+try {
+  const gaodeImagery = new Cesium.UrlTemplateImageryProvider({
+    url: 'https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    subdomains: ['01', '02', '03', '04'],
+    maximumLevel: 18,
+    credit: new Cesium.Credit('高德地图')
+  });
+  viewer.imageryLayers.addImageryProvider(gaodeImagery);
+} catch (e) {
+  console.warn('高德地图加载失败', e);
+}
+
+viewer.camera.setView({
+  destination: new Cesium.Cartesian3(
+-2178664.034669661,
+4389344.2357224375,
+4069666.063243071),
+  orientation: {
+    heading: 0,
+    pitch: Cesium.Math.toRadians(-45),
+    roll: 0
+  }
+});
+
+// ================================================================
+//  2. 扩散圆效果类（平行地面，不被遮挡）
+// ================================================================
+
+class ExpandingCircleEffect {
+  constructor(viewer) {
+    this._viewer = viewer;
+    this._effects = [];
+    this._counter = 0;
+    this._circleMarkers = [];
+  }
+
+  add(options) {
+    if (!options || !options.position) {
+      console.error('需要提供 position 参数');
+      return null;
+    }
+
+    const that = this;
+    const effectId = options.id || 'ExpandingCircle_' + (++this._counter);
+    const centerPosition = options.position;
+    const maxRadius = options.radius || 500;
+    const circleColor = options.color || Cesium.Color.RED;
+    const animationDuration = options.duration || 2000;
+    const edgeSmoothness = options.border || 4.0;
+
+    const centerCartesian3 = centerPosition;
+    const centerCartesian4 = new Cesium.Cartesian4(
+      centerCartesian3.x,
+      centerCartesian3.y,
+      centerCartesian3.z,
+      1
+    );
+
+    // 中心点上方500米（用于计算法线方向）
+    const wgs84 = this._cartesianToWGS84(centerPosition);
+    const aboveCenterCartesian3 = Cesium.Cartesian3.fromDegrees(
+      wgs84.lng,
+      wgs84.lat,
+      wgs84.alt + 500
+    );
+    const aboveCenterCartesian4 = new Cesium.Cartesian4(
+      aboveCenterCartesian3.x,
+      aboveCenterCartesian3.y,
+      aboveCenterCartesian3.z,
+      1
+    );
+
+    const startTime = new Date().getTime();
+
+    const borderPower = edgeSmoothness;
+
+    // 【关键修复】平行地面的扩散圆
+    const fragmentShader = `
+                    uniform sampler2D colorTexture;
+                    uniform sampler2D depthTexture;
+                    in vec2 v_textureCoordinates;
+                    uniform vec4 u_centerEC;
+                    uniform vec3 u_planeNormalEC;
+                    uniform float u_radius;
+                    uniform vec4 u_color;
+                    out vec4 fragColor;
+
+                    // 屏幕坐标 → 相机坐标
+                    vec4 screenToEye(in vec2 uv, in float depth) {
+                        vec2 clipXY = vec2((uv.x * 2.0 - 1.0), (uv.y * 2.0 - 1.0));
+                        vec4 eyePos = czm_inverseProjection * vec4(clipXY, depth, 1.0);
+                        eyePos = eyePos / eyePos.w;
+                        return eyePos;
+                    }
+
+                    // 深度解码
+                    float unpackDepthValue(in vec4 depth) {
+                        float z_window = czm_unpackDepth(depth);
+                        z_window = czm_reverseLogDepth(z_window);
+                        float n_range = czm_depthRange.near;
+                        float f_range = czm_depthRange.far;
+                        return (2.0 * z_window - n_range - f_range) / (f_range - n_range);
+                    }
+
+                    void main() {
+                        // 获取原始场景颜色
+                        fragColor = texture(colorTexture, v_textureCoordinates);
+
+                        // 获取真实深度
+                        float depth = unpackDepthValue(texture(depthTexture, v_textureCoordinates));
+
+                        // 如果深度无效（天空）则跳过
+                        if (depth > 0.999) return;
+
+                        // 计算像素在相机坐标系中的位置
+                        vec4 viewPos = screenToEye(v_textureCoordinates, depth);
+
+                        // 计算从中心到像素的向量
+                        vec3 dir = viewPos.xyz - u_centerEC.xyz;
+
+                        // 【关键】计算到中心平面的距离（平行于地面）
+                        // 使用法线方向投影，得到垂直距离
+                        float distToPlane = dot(dir, u_planeNormalEC);
+
+                        // 计算水平距离（平行于地面的距离）
+                        vec3 horizontalDir = dir - distToPlane * u_planeNormalEC;
+                        float horizontalDist = length(horizontalDir);
+
+                        // 半径判断：水平距离 < 半径
+                        if (horizontalDist < u_radius) {
+                            // 强度：中心最强，边缘渐弱
+                            float intensity = 1.0 - abs(u_radius - horizontalDist) / u_radius;
+                            intensity = pow(intensity, float(${borderPower}));
+
+                            // 平滑混合
+                            fragColor = mix(fragColor, u_color, intensity * 0.85);
+                            // 边缘发光增强
+                            fragColor.rgb += u_color.rgb * intensity * 0.2;
+                        }
+                    }
+                `;
+
+    const postProcessStage = new Cesium.PostProcessStage({
+      name: effectId,
+      fragmentShader: fragmentShader,
+      uniforms: {
+        u_centerEC: function() {
+          return Cesium.Matrix4.multiplyByVector(
+            that._viewer.camera._viewMatrix,
+            centerCartesian4,
+            new Cesium.Cartesian4()
+          );
+        },
+        u_planeNormalEC: function() {
+          const centerInEye = Cesium.Matrix4.multiplyByVector(
+            that._viewer.camera._viewMatrix,
+            centerCartesian4,
+            new Cesium.Cartesian4()
+          );
+          const aboveInEye = Cesium.Matrix4.multiplyByVector(
+            that._viewer.camera._viewMatrix,
+            aboveCenterCartesian4,
+            new Cesium.Cartesian4()
+          );
+          const normal = new Cesium.Cartesian3(
+            aboveInEye.x - centerInEye.x,
+            aboveInEye.y - centerInEye.y,
+            aboveInEye.z - centerInEye.z
+          );
+          return Cesium.Cartesian3.normalize(normal, normal);
+        },
+        u_radius: function() {
+          const elapsed = (new Date().getTime() - startTime) % animationDuration;
+          return (maxRadius * elapsed) / animationDuration;
+        },
+        u_color: circleColor
+      }
+    });
+
+    this._viewer.scene.postProcessStages.add(postProcessStage);
+
+    // 添加标记点
+    const marker = this._viewer.entities.add({
+      position: centerPosition,
+      point: {
+        pixelSize: 10,
+        color: circleColor,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2,
+        heightReference: Cesium.HeightReference.NONE
+      },
+      label: {
+        text: '📍 扩散中心',
+        font: '13px sans-serif',
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        pixelOffset: new Cesium.Cartesian2(0, -25),
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
+        backgroundPadding: new Cesium.Cartesian2(8, 4)
+      }
+    });
+
+    const effectData = {
+      stage: postProcessStage,
+      marker: marker,
+      id: effectId,
+      position: centerPosition,
+      color: circleColor,
+      radius: maxRadius,
+      duration: animationDuration,
+      border: edgeSmoothness,
+      startTime: startTime
+    };
+    this._effects.push(effectData);
+    this._circleMarkers.push(marker);
+
+    console.log('✅ 添加扩散圆: ' + effectId);
+    return postProcessStage;
+  }
+
+  clearAll() {
+    this._effects.forEach(effect => {
+      this._viewer.scene.postProcessStages.remove(effect.stage);
+      if (effect.marker) {
+        this._viewer.entities.remove(effect.marker);
+      }
+    });
+    this._effects = [];
+    this._circleMarkers = [];
+    this._counter = 0;
+    console.log('🗑 已清除所有扩散圆');
+  }
+
+  getCount() {
+    return this._effects.length;
+  }
+
+  getEffects() {
+    return this._effects;
+  }
+
+  _cartesianToWGS84(cartesian) {
+    const cartographic = Cesium.Cartographic.fromCartesian(cartesian);
+    return {
+      lng: Cesium.Math.toDegrees(cartographic.longitude),
+      lat: Cesium.Math.toDegrees(cartographic.latitude),
+      alt: cartographic.height
+    };
+  }
+}
+
+// ================================================================
+//  3. 实例化与UI绑定
+// ================================================================
+
+const expandingCircle = new ExpandingCircleEffect(viewer);
+
+let circleCount = 0;
+const circleCountEl = document.getElementById('circleCount');
+const currentPresetEl = document.getElementById('currentPreset');
+
+function updateStatus(name) {
+  circleCountEl.textContent = expandingCircle.getCount();
+  currentPresetEl.textContent = name ? ' | ' + name : '';
+}
+
+function getParams() {
+  const color = document.getElementById('colorPicker').value;
+  const speed = parseFloat(document.getElementById('speedSlider').value);
+  const radius = parseFloat(document.getElementById('radiusSlider').value);
+  const border = parseFloat(document.getElementById('borderSlider').value);
+  const height = parseFloat(document.getElementById('heightSlider').value);
+  return {
+    color,
+    speed,
+    radius,
+    border,
+    height
+  };
+}
+
+// ---- 添加扩散圆 ----
+function addCircle() {
+  const params = getParams();
+
+  const centerLng = 116.3974;
+  const centerLat = 39.9093;
+  const lng = centerLng + (Math.random() - 0.5) * 0.015;
+  const lat = centerLat + (Math.random() - 0.5) * 0.015;
+
+  // 高度由滑块控制
+  const position = Cesium.Cartesian3.fromDegrees(lng, lat, params.height);
+  const color = Cesium.Color.fromCssColorString(params.color);
+
+  expandingCircle.add({
+    position: position,
+    color: color,
+    radius: params.radius,
+    duration: 2000 / params.speed,
+    border: params.border
+  });
+
+  updateStatus('扩散圆 #' + (++circleCount));
+}
+
+function clearAll() {
+  expandingCircle.clearAll();
+  circleCount = 0;
+  updateStatus();
+}
+
+document.getElementById('addBtn').addEventListener('click', addCircle);
+document.getElementById('clearBtn').addEventListener('click', clearAll);
+
+document.getElementById('speedSlider').addEventListener('input', function() {
+  const val = parseFloat(this.value);
+  document.getElementById('speedValue').textContent = val.toFixed(1);
+  const effects = expandingCircle.getEffects();
+  effects.forEach(effect => {
+    effect.duration = 2000 / val;
+    effect.startTime = new Date().getTime();
+  });
+});
+
+document.getElementById('radiusSlider').addEventListener('input', function() {
+  document.getElementById('radiusValue').textContent = this.value;
+});
+
+document.getElementById('borderSlider').addEventListener('input', function() {
+  document.getElementById('borderValue').textContent = parseFloat(this.value).toFixed(1);
+});
+
+document.getElementById('heightSlider').addEventListener('input', function() {
+  document.getElementById('heightValue').textContent = this.value;
+});
+
+document.getElementById('colorPicker').addEventListener('input', function() {
+  console.log('💡 颜色变化请点击「添加扩散圆」生成新效果');
+});
+
+// ================================================================
+//  4. 初始化示例
+// ================================================================
+
+setTimeout(() => {
+  const centerPos = Cesium.Cartesian3.fromDegrees(116.3974, 39.9093, 10);
+  const color = Cesium.Color.fromCssColorString('#ff4444');
+
+  expandingCircle.add({
+    position: centerPos,
+    color: color,
+    radius: 500,
+    duration: 2000,
+    border: 4
+  });
+
+  updateStatus('扩散圆 #' + (++circleCount));
+  console.log('📍 默认扩散圆位于天安门上方10米（平行地面）');
+}, 1000);
+
+window.addEventListener('resize', () => {
+  viewer.resize();
+});
+
+console.log('✅ 自定义扩散圆已加载（平行地面版）');
+console.log('📌 扩散圆平行于地面，使用真实深度');
+console.log('📌 参数: 颜色、速度、半径、边缘柔和、高度');
+</script>
+<style>
+ * {
+   margin: 0;
+   padding: 0;
+   box-sizing: border-box;
+ }
+
+ html,
+ body {
+   width: 100%;
+   height: 100%;
+   overflow: hidden;
+   font-family: 'Microsoft YaHei', sans-serif;
+ }
+
+ #cesiumContainer {
+   width: 100%;
+   height: 100%;
+   position: relative;
+ }
+
+ .control-panel {
+   position: absolute;
+   bottom: 30px;
+   left: 50%;
+   transform: translateX(-50%);
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.85);
+   backdrop-filter: blur(12px);
+   padding: 16px 24px;
+   border-radius: 16px;
+   border: 1px solid rgba(255, 255, 255, 0.08);
+   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+   display: flex;
+   align-items: center;
+   gap: 10px;
+   flex-wrap: wrap;
+   justify-content: center;
+   max-width: 98%;
+ }
+
+ .control-panel button {
+   padding: 6px 14px;
+   border: none;
+   border-radius: 8px;
+   font-size: 12px;
+   font-weight: 600;
+   cursor: pointer;
+   transition: all 0.25s ease;
+   font-family: inherit;
+   white-space: nowrap;
+ }
+
+ .control-panel button:active {
+   transform: scale(0.95);
+ }
+
+ .btn-add {
+   background: #00aaff;
+   color: #fff;
+ }
+
+ .btn-add:hover {
+   background: #0099ee;
+   box-shadow: 0 0 20px rgba(0, 170, 255, 0.3);
+ }
+
+ .btn-clear {
+   background: rgba(255, 255, 255, 0.08);
+   color: #ccc;
+   border: 1px solid rgba(255, 255, 255, 0.06);
+ }
+
+ .btn-clear:hover {
+   background: rgba(255, 60, 60, 0.2);
+   color: #ff6b6b;
+   border-color: #ff6b6b;
+ }
+
+ .control-group {
+   display: flex;
+   align-items: center;
+   gap: 6px;
+   color: #aaa;
+   font-size: 11px;
+   flex-wrap: wrap;
+ }
+
+ .control-group label {
+   display: flex;
+   align-items: center;
+   gap: 3px;
+   white-space: nowrap;
+ }
+
+ .control-group input[type="color"] {
+   width: 24px;
+   height: 24px;
+   border: 2px solid rgba(255, 255, 255, 0.2);
+   border-radius: 6px;
+   cursor: pointer;
+   background: none;
+   padding: 0;
+ }
+
+ .control-group input[type="color"]::-webkit-color-swatch-wrapper {
+   padding: 2px;
+ }
+
+ .control-group input[type="color"]::-webkit-color-swatch {
+   border: none;
+   border-radius: 4px;
+ }
+
+ .control-group input[type="range"] {
+   width: 60px;
+   height: 4px;
+   -webkit-appearance: none;
+   background: rgba(255, 255, 255, 0.2);
+   border-radius: 2px;
+   outline: none;
+ }
+
+ .control-group input[type="range"]::-webkit-slider-thumb {
+   -webkit-appearance: none;
+   width: 12px;
+   height: 12px;
+   border-radius: 50%;
+   background: #00aaff;
+   cursor: pointer;
+ }
+
+ .control-group .value {
+   color: #00aaff;
+   font-weight: 600;
+   min-width: 28px;
+   text-align: center;
+ }
+
+ .status-bar {
+   position: absolute;
+   top: 20px;
+   right: 20px;
+   z-index: 100;
+   background: rgba(0, 0, 0, 0.7);
+   backdrop-filter: blur(8px);
+   padding: 10px 16px;
+   border-radius: 10px;
+   color: #aaa;
+   font-size: 12px;
+   border: 1px solid rgba(255, 255, 255, 0.05);
+   font-family: monospace;
+   pointer-events: none;
+   max-width: 350px;
+ }
+
+ .status-bar .highlight {
+   color: #00aaff;
+   font-weight: 600;
+ }
+
+ .cesium-viewer-cesiumCreditContainer {
+   display: none !important;
+ }
+
+ @media (max-width: 768px) {
+   .control-panel {
+     bottom: 12px;
+     padding: 8px 10px;
+     gap: 6px;
+     width: 98%;
+     border-radius: 12px;
+   }
+
+   .control-panel button {
+     font-size: 10px;
+     padding: 4px 10px;
+   }
+
+   .control-group input[type="range"] {
+     width: 40px;
+   }
+
+   .control-group {
+     font-size: 10px;
+   }
+
+   .status-bar {
+     top: 12px;
+     right: 12px;
+     padding: 6px 10px;
+     font-size: 10px;
+     max-width: 200px;
+   }
+ }
+</style>
+
+<!-- Settings Section - 设置数据，将被自动解析 -->
+<settings>
+<head-metadata>
+
+</head-metadata>
+<css-links>
+
+</css-links>
+<js-links>
+
+</js-links>
+</settings>
